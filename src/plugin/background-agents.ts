@@ -1,0 +1,203 @@
+/**
+ * background-agents
+ * Unified delegation system for OpenCode
+ *
+ * Replaces native `task` tool with persistent, async-first agent delegation.
+ * All agent outputs are persisted to storage, orchestrator receives only key references.
+ *
+ * Based on oh-my-opencode by @code-yeongyu (MIT License)
+ * https://github.com/code-yeongyu/oh-my-opencode
+ *
+ * This file is the plugin entry point. Implementation is split into sibling modules:
+ *   id - metadata - types - logger - agent-capability - delegation-manager - tools - rules - context
+ */
+
+import * as fs from "node:fs/promises"
+import * as os from "node:os"
+import * as path from "node:path"
+import type { Plugin } from "@opencode-ai/plugin"
+import type { Event, Part } from "@opencode-ai/sdk"
+import { parseAgentMode, parseAgentWriteCapability } from "./agent-capability"
+import { formatDelegationContext } from "./context"
+import { DelegationManager } from "./delegation-manager"
+import { createLogger } from "./logger"
+import { getProjectId } from "./primitives/get-project-id"
+import type { OpencodeClient } from "./primitives/types"
+import { DELEGATION_RULES } from "./rules"
+import {
+	createDelegate,
+	createDelegationList,
+	createDelegationRead,
+	createDelegationStatus,
+	createDelegationSteer,
+	createDelegationStop,
+} from "./tools"
+
+/**
+ * Expected input for experimental.chat.system.transform hook.
+ */
+interface SystemTransformInput {
+	agent?: string
+	sessionID?: string
+}
+
+const BackgroundAgentsPlugin: Plugin = async (ctx) => {
+	const { client, directory } = ctx
+
+	// Create logger early for all components
+	const log = createLogger(client as OpencodeClient)
+
+	// Project-level storage directory (shared across sessions)
+	// Uses git root commit hash for cross-worktree consistency
+	const projectId = await getProjectId(directory)
+	const baseDir = path.join(os.homedir(), ".local", "share", "opencode", "delegations", projectId)
+
+	// Ensure base directory exists (for debug logs etc)
+	await fs.mkdir(baseDir, { recursive: true })
+
+	const manager = new DelegationManager(client as OpencodeClient, baseDir, log)
+
+	await manager.debugLog("BackgroundAgentsPlugin initialized with delegation system")
+
+	return {
+		tool: {
+			delegate: createDelegate(manager),
+			delegation_read: createDelegationRead(manager),
+			delegation_list: createDelegationList(manager),
+			delegation_steer: createDelegationSteer(manager),
+			delegation_stop: createDelegationStop(manager),
+			delegation_status: createDelegationStatus(manager),
+		},
+
+		// Prevent read-only agents from using native task tool (symmetric to delegate enforcement)
+		"tool.execute.before": async (
+			input: { tool: string },
+			output: { args?: { subagent_type?: string } },
+		) => {
+			// Guard: Only intercept task tool
+			if (input.tool !== "task") return
+
+			// Guard: Require agent name
+			const agentName = output.args?.subagent_type
+			if (!agentName) return
+
+			// Parse boundary 1: Check agent mode
+			const { isSubAgent } = await parseAgentMode(client as OpencodeClient, agentName, log)
+
+			// Guard: Allow non-sub-agents (main/built-in)
+			if (!isSubAgent) return
+
+			// Parse boundary 2: Check write capability (only for sub-agents)
+			const { isReadOnly } = await parseAgentWriteCapability(
+				client as OpencodeClient,
+				agentName,
+				log,
+			)
+
+			// Guard: Allow write-capable agents
+			if (!isReadOnly) return
+
+			// Fail fast: Read-only sub-agent via task is invalid
+			throw new Error(
+				`❌ Agent '${agentName}' is read-only and should use the delegate tool for async background execution.\n\n` +
+					`Read-only agents have: edit="deny", write="deny", bash={"*":"deny"}\n` +
+					`Use delegate for read-only sub-agents.\n` +
+					`Use task for write-capable sub-agents.`,
+			)
+		},
+
+		// Inject delegation rules into system prompt
+		"experimental.chat.system.transform": async (_input: SystemTransformInput, output) => {
+			output.system.push(DELEGATION_RULES)
+		},
+
+		// Deliver queued parent notifications on the next user turn if direct delivery failed.
+		"chat.message": async (
+			input: { sessionID?: string },
+			output: { parts?: Array<{ type: string; text?: string }> },
+		) => {
+			if (!input.sessionID) return
+			manager.injectPendingNotificationsIntoChatMessage(output, input.sessionID)
+		},
+
+		// Compaction hook - inject delegation context for context recovery
+		"experimental.session.compacting": async (
+			input: { sessionID: string },
+			output: { context: string[]; prompt?: string },
+		) => {
+			const rootSessionID = await manager.getRootSessionID(input.sessionID)
+
+			// Running delegations in this root session tree
+			const running = manager.getRunningDelegations(rootSessionID).map((d) => ({
+				id: d.id,
+				agent: d.agent,
+				title: d.title,
+				description: d.description,
+				status: d.status,
+				startedAt: d.startedAt,
+				lastHeartbeatAt: d.progress.lastHeartbeatAt,
+				prompt: d.prompt,
+			}))
+
+			// Unread completed delegations to carry forward through compaction
+			const unreadCompleted = manager.getUnreadCompletedDelegations(rootSessionID, 10).map((d) => ({
+				id: d.id,
+				agent: d.agent,
+				title: d.title,
+				description: d.description,
+				status: d.status,
+				completedAt: d.completedAt,
+			}))
+
+			// Early exit if nothing to inject
+			if (running.length === 0 && unreadCompleted.length === 0) return
+
+			output.context.push(formatDelegationContext(running, unreadCompleted))
+		},
+
+		// Event hook
+		event: async ({ event }: { event: Event }): Promise<void> => {
+			if (event.type === "session.status") {
+				const statusType = event.properties.status?.type
+				const sessionID = event.properties.sessionID
+				if (statusType === "idle" && sessionID) {
+					await manager.handleSessionIdle(sessionID)
+				}
+			}
+
+			if (event.type === "session.idle") {
+				const sessionID = event.properties.sessionID
+				if (sessionID) {
+					await manager.handleSessionIdle(sessionID)
+				}
+			}
+
+			if (event.type === "message.updated") {
+				const eventProperties = event.properties as {
+					info: { sessionID?: string; role?: string }
+					parts?: Part[]
+				}
+				const sessionID = eventProperties.info.sessionID
+				if (sessionID) {
+					const messageText =
+						eventProperties.info.role === "assistant"
+							? (eventProperties.parts
+									?.filter((part) => part.type === "text")
+									.map((part) => part.text)
+									.join("\n") ?? undefined)
+							: undefined
+					manager.handleMessageEvent(sessionID, messageText)
+				}
+			}
+		},
+	}
+}
+
+const BackgroundAgentsPluginWithInternals = Object.assign(BackgroundAgentsPlugin, {
+	testInternals: {
+		DelegationManager,
+		formatDelegationContext,
+	},
+} as const)
+
+export default BackgroundAgentsPluginWithInternals

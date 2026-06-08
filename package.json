@@ -1,0 +1,54 @@
+{
+  "name": "@aeondave/opencode-background-agents",
+  "version": "0.1.0",
+  "description": "Async, supervised background agent delegation for OpenCode - delegate, steer, stop, and persist sub-agent work.",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "agents",
+    "subagents",
+    "delegation",
+    "background-agents"
+  ],
+  "homepage": "https://github.com/AeonDave/opencode-background-agents#readme",
+  "bugs": "https://github.com/AeonDave/opencode-background-agents/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AeonDave/opencode-background-agents.git"
+  },
+  "license": "MIT",
+  "type": "module",
+  "main": "src/plugin/background-agents.ts",
+  "exports": {
+    ".": "./src/plugin/background-agents.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "unique-names-generator": "^4.7.1"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*",
+    "@opencode-ai/sdk": "*"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    },
+    "@opencode-ai/sdk": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest",
+    "@opencode-ai/sdk": "latest",
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}

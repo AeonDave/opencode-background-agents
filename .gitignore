@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+.npm/
+
+# Lockfiles (library package: dependency resolution is left to the consumer)
+package-lock.json
+npm-shrinkwrap.json
+yarn.lock
+pnpm-lock.yaml
+bun.lock
+bun.lockb
+
+# TypeScript / build output
+*.tsbuildinfo
+dist/
+build/
+out/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / IDE
+.idea/
+*.swp
+*.swo
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Caches
+.cache/
+.tmp/
+tmp/
