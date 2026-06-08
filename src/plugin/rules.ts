@@ -1,4 +1,9 @@
-const DELEGATION_RULES = `<task-notification>
+import { STRICT_READONLY } from "./types"
+
+/**
+ * Shared sections, identical regardless of routing mode.
+ */
+const COMMON_HEADER = `<task-notification>
 <delegation-system>
 
 ## Async Delegation
@@ -15,9 +20,42 @@ You are NOT blocked while a delegation runs — you can observe and adjust it:
 - \`delegation_steer(id, message)\` - Inject an extra instruction into a RUNNING task (add a constraint, redirect, supply context). The agent acts on it in its current run; if the session is mid-step the steer is queued and delivered at the next turn boundary (never dropped).
 - \`delegation_stop(id)\` - Abort a running task; partial output is saved and readable via \`delegation_read(id)\`.
 
-Use status to decide; steer to course-correct without restarting; stop to cancel off-track work. Still rely on \`<task-notification>\` for completion — do not poll.
+Use status to decide; steer to course-correct without restarting; stop to cancel off-track work. Still rely on \`<task-notification>\` for completion — do not poll.`
 
-## Delegation Routing
+/**
+ * Relaxed mode (default): every sub-agent — read-only OR write/bash-capable — runs as an
+ * async background delegation via \`delegate\`. The native blocking \`task\` tool must NOT be
+ * used for sub-agents, because it freezes this (supervisor) session until the sub-agent
+ * finishes, which defeats the whole point of background delegation.
+ */
+const RELAXED_ROUTING = `## Delegation Routing
+
+**Always use \`delegate\` to dispatch a sub-agent.** This applies to EVERY sub-agent,
+including write- and bash-capable ones (coders, operators, builders). \`delegate\` returns
+an ID immediately and runs the agent in the background, so you stay free to keep working,
+observe, steer, or stop it.
+
+**Do NOT use the native \`task\` tool for sub-agents.** \`task\` runs synchronously and BLOCKS
+this session until the sub-agent finishes — no async, no steering, no parallelism. It is
+intercepted and rejected for sub-agents in this mode; use \`delegate\` instead.
+
+> Caveat: a write-capable agent's file/bash side effects run outside OpenCode's
+> undo/branching tree and cannot be reverted via the UI. That is the accepted trade-off
+> for background execution in this mode.
+
+## How It Works
+
+1. Call \`delegate(prompt, agent)\` with a detailed prompt — for ANY sub-agent
+2. Continue productive work while it runs (steer/stop/status as needed)
+3. Receive a \`<task-notification>\` when it completes
+4. Call \`delegation_read(id)\` to retrieve results`
+
+/**
+ * Strict mode (BACKGROUND_AGENTS_STRICT_READONLY=1): only read-only sub-agents may run as
+ * background delegations; write-capable sub-agents are forced onto the native \`task\` tool to
+ * preserve OpenCode's undo/branching for their side effects.
+ */
+const STRICT_ROUTING = `## Delegation Routing
 
 Agents route based on their permissions:
 
@@ -35,18 +73,32 @@ Agents route based on their permissions:
 2. For write-capable sub-agents: Call \`task\` with detailed prompt
 3. Continue productive work while it runs
 4. Receive notification when complete
-5. Call \`delegation_read(id)\` to retrieve results
+5. Call \`delegation_read(id)\` to retrieve results`
 
-## Critical Constraints
+const COMMON_FOOTER = `## Critical Constraints
 
 **NEVER poll \`delegation_list\` to check completion.**
 You WILL be notified via \`<task-notification>\`. Polling wastes tokens.
 
 **NEVER wait idle.** Always have productive work while delegations run.
 
-**Using wrong tool will fail fast with guidance.**
+**Using the wrong tool will fail fast with guidance.**
 
 </delegation-system>
 </task-notification>`
 
-export { DELEGATION_RULES }
+/**
+ * Build the delegation rules injected into the system prompt. The routing section reflects
+ * the live \`STRICT_READONLY\` configuration so the model is told the SAME policy the
+ * \`tool.execute.before\` guard actually enforces — preventing the model from picking the
+ * blocking native \`task\` tool when background delegation is what's configured.
+ */
+function buildDelegationRules(strictReadonly: boolean = STRICT_READONLY): string {
+	const routing = strictReadonly ? STRICT_ROUTING : RELAXED_ROUTING
+	return `${COMMON_HEADER}\n\n${routing}\n\n${COMMON_FOOTER}`
+}
+
+/** Pre-built rules for the current process configuration. */
+const DELEGATION_RULES = buildDelegationRules()
+
+export { DELEGATION_RULES, buildDelegationRules }

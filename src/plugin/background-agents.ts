@@ -32,6 +32,7 @@ import {
 	createDelegationSteer,
 	createDelegationStop,
 } from "./tools"
+import { STRICT_READONLY } from "./types"
 
 /**
  * Expected input for experimental.chat.system.transform hook.
@@ -87,14 +88,28 @@ const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 			// Guard: Allow non-sub-agents (main/built-in)
 			if (!isSubAgent) return
 
-			// Parse boundary 2: Check write capability (only for sub-agents)
+			// Relaxed mode (default): every sub-agent — read-only OR write-capable — must go
+			// through `delegate` so it runs async in the background. The native `task` tool is
+			// synchronous and would BLOCK this supervisor session until the sub-agent finishes,
+			// which is exactly the bug this guard prevents. Redirect all sub-agents to delegate.
+			if (!STRICT_READONLY) {
+				throw new Error(
+					`❌ Agent '${agentName}' is a sub-agent — use the delegate tool for async background execution.\n\n` +
+						`The native task tool runs synchronously and blocks this session until the sub-agent finishes.\n` +
+						`Call delegate(agent="${agentName}", prompt=...) instead — it returns an ID immediately and runs in the background.\n` +
+						`(Set BACKGROUND_AGENTS_STRICT_READONLY=1 to route write-capable sub-agents through task instead.)`,
+				)
+			}
+
+			// Strict mode: only read-only sub-agents are forced onto delegate; write-capable
+			// sub-agents keep using the native task tool to preserve undo/branching.
 			const { isReadOnly } = await parseAgentWriteCapability(
 				client as OpencodeClient,
 				agentName,
 				log,
 			)
 
-			// Guard: Allow write-capable agents
+			// Guard: Allow write-capable agents (strict mode only)
 			if (!isReadOnly) return
 
 			// Fail fast: Read-only sub-agent via task is invalid
