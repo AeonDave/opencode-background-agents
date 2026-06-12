@@ -1,10 +1,12 @@
 import { tool } from "@opencode-ai/plugin"
 import type { ToolContext } from "@opencode-ai/plugin"
 import type { DelegationManager } from "./delegation-manager"
+import { DEFAULT_MAX_RUN_TIME_MS, isUnlimitedRunTime } from "./types"
 
 interface DelegateArgs {
 	prompt: string
 	agent: string
+	timeout_minutes?: number
 }
 
 function createDelegate(manager: DelegationManager): ReturnType<typeof tool> {
@@ -27,6 +29,16 @@ Use \`delegation_read\` with the ID to retrieve full persisted output (including
 				.describe(
 					'Agent to delegate to. Any sub-agent works; write/bash-capable agents run in the background too (their changes live outside undo/branching). Set BACKGROUND_AGENTS_STRICT_READONLY=1 to restrict to read-only sub-agents only.',
 				),
+			timeout_minutes: tool.schema
+				.number()
+				.int()
+				.min(0)
+				.optional()
+				.describe(
+					`Optional max runtime in minutes for THIS delegation (default ${Math.round(
+						DEFAULT_MAX_RUN_TIME_MS / 60_000,
+					)}). Use 0 for NO timeout — you stay in control via delegation_steer/delegation_stop. Size it to the task: short for quick lookups, long (or 0) for deep research/builds. A delivered steer re-opens a fresh window of the same size.`,
+				),
 		},
 		async execute(args: DelegateArgs, toolCtx: ToolContext): Promise<string> {
 			if (!toolCtx?.sessionID) {
@@ -43,13 +55,19 @@ Use \`delegation_read\` with the ID to retrieve full persisted output (including
 					parentAgent: toolCtx.agent,
 					prompt: args.prompt,
 					agent: args.agent,
+					// 0 is meaningful (no timeout): only an omitted argument falls back to the default.
+					maxRunTimeMs:
+						args.timeout_minutes !== undefined ? args.timeout_minutes * 60_000 : undefined,
 				})
 
 				// Get total active count for this parent session
 				const pendingSet = manager.getPendingCount(toolCtx.sessionID)
 				const totalActive = pendingSet
 
-				let response = `Delegation started: ${delegation.id}\nAgent: ${args.agent}`
+				const timeoutLabel = isUnlimitedRunTime(delegation.maxRunTimeMs)
+					? "none (steer/stop it whenever needed)"
+					: `${Math.round(delegation.maxRunTimeMs / 60_000)}min (a steer resets the window)`
+				let response = `Delegation started: ${delegation.id}\nAgent: ${args.agent}\nTimeout: ${timeoutLabel}`
 				if (totalActive > 1) {
 					response += `\n\n${totalActive} delegations now active.`
 				}
@@ -129,6 +147,25 @@ Only works while the delegation is active (registered/running); finished tasks r
 	})
 }
 
+function createDelegationPeek(manager: DelegationManager): ReturnType<typeof tool> {
+	return tool({
+		description: `Peek at the LIVE transcript of a RUNNING delegation without blocking or stopping it.
+Returns a digest of what the agent has done so far (assistant text, tool activity, steers)
+so you can decide mid-run whether to steer, stop, or let it continue.
+Read-only and instant. Use when a delegation is long-running and you need evidence for a
+decision — do NOT call it in a polling loop; completion still arrives via <task-notification>.`,
+		args: {
+			id: tool.schema.string().describe("The delegation ID to peek at (e.g., 'elegant-blue-tiger')."),
+		},
+		async execute(args: { id: string }, toolCtx: ToolContext): Promise<string> {
+			if (!toolCtx?.sessionID) {
+				return "❌ delegation_peek requires sessionID. This is a system error."
+			}
+			return await manager.peekDelegation(toolCtx.sessionID, args.id)
+		},
+	})
+}
+
 function createDelegationStop(manager: DelegationManager): ReturnType<typeof tool> {
 	return tool({
 		description: `Stop a RUNNING delegation. Aborts its session and saves any partial output.
@@ -164,6 +201,7 @@ stop a task. This is a cheap status check — it does NOT block or poll for comp
 export {
 	createDelegate,
 	createDelegationList,
+	createDelegationPeek,
 	createDelegationRead,
 	createDelegationStatus,
 	createDelegationSteer,

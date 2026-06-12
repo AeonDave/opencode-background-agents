@@ -9,7 +9,7 @@ const COMMON_HEADER = `<task-notification>
 ## Async Delegation
 
 You have tools for parallel background work:
-- \`delegate(prompt, agent)\` - Launch task, returns ID immediately
+- \`delegate(prompt, agent, timeout_minutes?)\` - Launch task, returns ID immediately. Size \`timeout_minutes\` to the task (default 15, **0 = no timeout** — you stay in control via steer/stop); a delivered steer re-opens a fresh window.
 - \`delegation_read(id)\` - Retrieve completed result
 - \`delegation_list()\` - List delegations (use sparingly)
 
@@ -17,10 +17,11 @@ You have tools for parallel background work:
 
 You are NOT blocked while a delegation runs — you can observe and adjust it:
 - \`delegation_status()\` - Cheap live status (elapsed, tool calls, heartbeat, steers). Does NOT poll for completion.
-- \`delegation_steer(id, message)\` - Inject an extra instruction into a RUNNING task (add a constraint, redirect, supply context). The agent acts on it in its current run; if the session is mid-step the steer is queued and delivered at the next turn boundary (never dropped).
+- \`delegation_peek(id)\` - Live transcript digest of a RUNNING task (what it has done so far). Use it to gather evidence for a steer/stop decision mid-run — not as a completion poll.
+- \`delegation_steer(id, message)\` - Inject an extra instruction into a RUNNING task (add a constraint, redirect, supply context). Delivered into the agent's CURRENT run via native server-side steering, even mid-step. If delivery fails the tool tells you — retry shortly or stop the task.
 - \`delegation_stop(id)\` - Abort a running task; partial output is saved and readable via \`delegation_read(id)\`.
 
-Use status to decide; steer to course-correct without restarting; stop to cancel off-track work. Still rely on \`<task-notification>\` for completion — do not poll.`
+Use status to notice, peek to inspect, steer to course-correct without restarting, stop to cancel off-track work. Still rely on \`<task-notification>\` for completion — do not poll.`
 
 /**
  * Relaxed mode (default): every sub-agent — read-only OR write/bash-capable — runs as an

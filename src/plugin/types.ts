@@ -74,7 +74,10 @@ interface DelegationRecord {
 	startedAt?: Date
 	completedAt?: Date
 	updatedAt: Date
-	timeoutAt: Date
+	/** Deadline for the current window; absent when the delegation has no timeout. */
+	timeoutAt?: Date
+	/** Effective max runtime; a delivered steer re-opens a window of this size. 0 = unlimited. */
+	maxRunTimeMs: number
 	progress: DelegationProgress
 	notification: DelegationNotificationState
 	retrieval: DelegationRetrievalState
@@ -85,7 +88,26 @@ interface DelegationRecord {
 	result?: string
 }
 
-const DEFAULT_MAX_RUN_TIME_MS = 15 * 60 * 1000 // 15 minutes
+// Default max runtime. Overridable globally via BACKGROUND_AGENTS_TIMEOUT_MINUTES and
+// per-delegation via the `timeout_minutes` argument of `delegate`. The value 0 means
+// NO timeout: the supervisor stays in control via delegation_steer / delegation_stop.
+const DEFAULT_MAX_RUN_TIME_MS = (() => {
+	const minutes = Number(process.env.BACKGROUND_AGENTS_TIMEOUT_MINUTES)
+	if (Number.isFinite(minutes) && minutes >= 0) {
+		return minutes * 60_000
+	}
+	return 15 * 60 * 1000 // 15 minutes
+})()
+
+/** 0 (or negative) maxRunTimeMs = unlimited: no timer, no deadline. */
+function isUnlimitedRunTime(maxRunTimeMs: number): boolean {
+	return maxRunTimeMs <= 0
+}
+
+// Bounded wait used by delegation_read on a delegation WITHOUT a deadline: read cannot
+// block forever inside a tool call, so it waits this long and then defers to the
+// terminal <task-notification>.
+const READ_WAIT_UNLIMITED_MS = 2 * 60_000
 const TERMINAL_WAIT_GRACE_MS = 10_000
 const READ_POLL_INTERVAL_MS = 250
 const ALL_COMPLETE_QUIET_PERIOD_MS = 50
@@ -120,6 +142,8 @@ interface DelegateInput {
 	parentAgent: string
 	prompt: string
 	agent: string
+	/** Supervisor-chosen max runtime; 0 = unlimited. Falls back to the configured default. */
+	maxRunTimeMs?: number
 }
 
 interface DelegationListItem {
@@ -131,13 +155,24 @@ interface DelegationListItem {
 	unread?: boolean
 }
 
+/**
+ * Native (v2 API) steer transport: deliver `text` into the LIVE run of `sessionID` via
+ * the server's `delivery: "steer"` prompt mode. Returns true when delivered; false when
+ * the server lacks the capability or the request failed (callers fall back to v1).
+ * Implementations never throw.
+ */
+type NativeSteerFn = (sessionID: string, text: string) => Promise<boolean>
+
 interface DelegationManagerOptions {
 	maxRunTimeMs?: number
 	readPollIntervalMs?: number
 	terminalWaitGraceMs?: number
 	allCompleteQuietPeriodMs?: number
+	completeDebounceMs?: number
+	readWaitUnlimitedMs?: number
 	idGenerator?: () => string
 	metadataGenerator?: typeof generateMetadata
+	nativeSteer?: NativeSteerFn
 }
 
 function isTerminalStatus(status: DelegationStatus): status is DelegationTerminalStatus {
@@ -179,9 +214,12 @@ export type {
 	DelegateInput,
 	DelegationListItem,
 	DelegationManagerOptions,
+	NativeSteerFn,
 }
 export {
 	DEFAULT_MAX_RUN_TIME_MS,
+	READ_WAIT_UNLIMITED_MS,
+	isUnlimitedRunTime,
 	TERMINAL_WAIT_GRACE_MS,
 	READ_POLL_INTERVAL_MS,
 	ALL_COMPLETE_QUIET_PERIOD_MS,

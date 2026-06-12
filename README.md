@@ -1,27 +1,34 @@
 # opencode-background-agents
 
-> Keep working while research runs in the background. Results survive context compaction.
+Async background delegation for [OpenCode](https://github.com/sst/opencode) — fire off tasks, keep working, steer or stop mid-run, and retrieve persisted results after compaction or restart.
 
-A plugin for [OpenCode](https://github.com/sst/opencode) that turns sub-agent delegation into an async, supervised workflow. Fire off tasks, keep coding, steer or stop them mid-run, and retrieve persisted results whenever you need them.
+## Contents
 
-## Credits
+- [Why use it](#why-use-it)
+- [How it works](#how-it-works)
+- [Tools](#tools)
+- [Interactive control](#interactive-control)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Best practices](#best-practices)
+- [Monitoring](#monitoring)
+- [Lifecycle and reliability](#lifecycle-and-reliability)
+- [Development](#development)
+- [FAQ](#faq)
+- [Credits](#credits)
+- [Disclaimer](#disclaimer)
+- [License](#license)
 
-This is a new, independent project built on an existing idea. The core concept — async "fire-and-forget" delegation with disk-persisted results — comes from [kdcokenny/opencode-background-agents](https://github.com/kdcokenny/opencode-background-agents), and the underlying delegation engine is based on [oh-my-opencode](https://github.com/code-yeongyu/oh-my-opencode) by @code-yeongyu (MIT).
+## Why use it
 
-This project goes further with two main advantages:
+Context windows fill up. When compaction kicks in, past research vanishes and the AI re-does work it already did. This plugin addresses that by:
 
-- **Interactive supervisor control** — check status, inject instructions, or cancel a delegation while it runs, instead of only firing and forgetting.
-- **Write-capable background agents** — write- and bash-capable sub-agents can run in the background too, not just read-only ones (toggleable).
+- **Keeping you unblocked.** Delegate a task and continue the conversation immediately; no waiting for a sub-agent to finish.
+- **Surviving compaction.** Results are written to disk as markdown. After compaction, the AI retrieves them by ID rather than re-running the task.
+- **Giving mid-run control.** Check status, inject instructions, or abort a delegation while it runs — not just fire-and-forget.
+- **Allowing write-capable agents.** Write- and bash-capable sub-agents can run in the background too, not only read-only ones (toggleable via env var).
 
-## Why This Exists
-
-Context windows fill up. When compaction kicks in, the AI loses track of research it just did, then re-explains and re-researches. Background agents fix this:
-
-- **Keep working** — Delegate a task and continue the conversation. You are never blocked waiting for a sub-agent.
-- **Survive compaction** — Results are written to disk as markdown. When context gets tight, the AI knows exactly where to retrieve past work.
-- **Stay in control** — Check status, steer, or stop a running delegation at any time.
-
-## How It Works
+## How it works
 
 ```
 1. Delegate   →  "Research OAuth2 PKCE best practices"
@@ -31,34 +38,36 @@ Context windows fill up. When compaction kicks in, the AI loses track of researc
 5. Retrieve   →  delegation_read(id) returns the full result
 ```
 
-Each delegation runs in its own isolated OpenCode session and is auto-tagged with a title and summary. Results are persisted to `~/.local/share/opencode/delegations/<project>/` as markdown, so the AI can scan past research and retrieve exactly what it needs — even after compaction, restarts, or crashes.
+Each delegation runs in its own isolated OpenCode session and is auto-tagged with a title and summary on completion. Results are persisted to `~/.local/share/opencode/delegations/<project>/` as markdown, so the AI can locate and retrieve past work even after compaction, restarts, or crashes.
 
 ## Tools
 
-The plugin registers six tools:
-
 | Tool | Purpose |
 |------|---------|
-| `delegate(prompt, agent)` | Launch a background task; returns a readable ID immediately |
-| `delegation_read(id)` | Retrieve the full persisted result of a delegation |
-| `delegation_list()` | List all delegations with titles, summaries, and read state |
-| `delegation_status()` | Cheap live status of active delegations (elapsed, tool calls, heartbeat, steer count) — never blocks or polls |
-| `delegation_steer(id, message)` | Inject an extra instruction into a **running** delegation |
-| `delegation_stop(id)` | Abort a running delegation and keep its partial output |
+| `delegate(prompt, agent, timeout_minutes?)` | Launch a background task; returns a readable ID immediately. The supervisor can size the timeout per task. |
+| `delegation_read(id)` | Retrieve the full persisted result of a delegation. |
+| `delegation_list()` | List all delegations with titles, summaries, and read state. |
+| `delegation_status()` | Live status of active delegations (elapsed, tool calls, heartbeat, steer count) — instant, never polls. |
+| `delegation_peek(id)` | Live transcript digest of a running delegation — read intermediate work to decide whether to steer or stop. |
+| `delegation_steer(id, message)` | Inject an extra instruction into a running delegation. |
+| `delegation_stop(id)` | Abort a running delegation and keep its partial output. |
 
-### Interactive control
+## Interactive control
 
-`status`, `steer`, and `stop` give the supervisor mid-run control, similar to a lead talking to a teammate:
+`status`, `peek`, `steer`, and `stop` give mid-run supervisor control without blocking the main conversation.
 
-- **Status** is read from memory and instant — use it to decide whether to intervene.
-- **Steer** queues an instruction at the next turn boundary, so it is never dropped. Steering extends the run until the steered turn settles.
-- **Stop** aborts the session cleanly; partial output is saved and readable with `delegation_read(id)`, marked `[STOPPED BY SUPERVISOR]`.
+- **Status** is read from memory and instant. Use it to notice that a delegation needs attention.
+- **Peek** reads the live transcript of a running delegation — assistant text, tool activity, steers sent so far — without affecting it. Use it to gather evidence before deciding whether to steer or stop.
+- **Steer** uses OpenCode's native server-side steering (`delivery: "steer"`, OpenCode >= 1.17): the instruction is injected into the agent's current run, even while the session is mid-step. On older servers the plugin falls back to a direct v1 prompt; if the session is busy and rejects it, the tool reports the failure so the supervisor can retry or stop. A delivered steer extends the run and resets the timeout window.
+- **Stop** aborts the session cleanly. Partial output is saved and readable via `delegation_read(id)`, marked `[STOPPED BY SUPERVISOR]`.
 
-Completion is still delivered via `<task-notification>` — there is no need to poll.
+Completion is delivered via `<task-notification>` — there is no need to poll.
+
+Notifications are split by audience: the model receives the `<task-notification>` XML as a hidden synthetic part (the TUI does not render it), while the human gets a TUI toast. The chat stays clean and the supervisor still receives full machine-readable context.
 
 ## Installation
 
-### From npm (recommended)
+### From npm
 
 Add the package to the `plugin` array in your OpenCode config at `~/.config/opencode/opencode.json`:
 
@@ -70,9 +79,9 @@ Add the package to the `plugin` array in your OpenCode config at `~/.config/open
 
 OpenCode installs the plugin and its dependencies automatically on the next start. To pin a version, replace `@latest` with a specific version (e.g. `@0.1.0`).
 
-### From a local clone (shim)
+### From source (git clone)
 
-Run from a local checkout — useful before publishing or while hacking on the plugin:
+Run from a local checkout — useful before publishing or while hacking on the plugin.
 
 1. Clone the repository and install dependencies:
 
@@ -91,7 +100,7 @@ Run from a local checkout — useful before publishing or while hacking on the p
    export { default } from "/absolute/path/to/opencode-background-agents/src/plugin/background-agents.ts"
    ```
 
-   On Windows, use forward slashes and include the drive letter, for example:
+   On Windows, use forward slashes and include the drive letter:
 
    ```ts
    export { default } from "C:/opencode-background-agents/src/plugin/background-agents.ts"
@@ -99,21 +108,32 @@ Run from a local checkout — useful before publishing or while hacking on the p
 
 3. Restart OpenCode. The plugin loads from your working tree, so edits to `src/` take effect on the next restart. Delete the shim file to uninstall.
 
-> Use one method at a time. If you add the npm entry, remove the local shim (and vice versa) so the plugin is not loaded twice.
+> Use one method at a time. If you add the npm entry, remove the local shim (and vice versa) to avoid loading the plugin twice.
 
 ## Configuration
 
 | Environment variable | Default | Effect |
 |----------------------|---------|--------|
 | `BACKGROUND_AGENTS_STRICT_READONLY` | unset | When set to `1`, only read-only sub-agents may use `delegate`; write/bash-capable agents are rejected and told to use the native `task` tool. |
+| `BACKGROUND_AGENTS_TIMEOUT_MINUTES` | `15` | Default max runtime per delegation. `0` = no timeout. |
 
-By default the read-only restriction is **relaxed**: write- and bash-capable sub-agents can run as background delegations, with a logged warning. Background sessions live outside OpenCode's undo/branching tree, so their file/bash side effects cannot be reverted through the UI. Enable strict mode if you want the original safe behavior.
+By default the read-only restriction is relaxed: write- and bash-capable sub-agents can run as background delegations, with a logged warning. Background sessions live outside OpenCode's undo/branching tree, so their file and bash side effects cannot be reverted through the UI. Enable strict mode if you want the original safe behavior.
 
-Delegations time out after **15 minutes**.
+### Timeouts
 
-## Real-Time Monitoring
+Each delegation gets its own timeout window (default 15 minutes). The supervisor sets it per task via `delegate(..., timeout_minutes)` — short for quick lookups, long for deep research or builds, or `0` for no timeout at all. Because the supervisor can steer or stop a delegation at any moment, an unbounded run is a legitimate choice, not a leak. A delivered steer re-opens a fresh window of the same size. `delegation_status()` shows remaining time (or `no timeout`) per task.
 
-Besides `delegation_status()`, you can navigate sub-agent sessions in the TUI:
+## Best practices
+
+- **Size timeouts per task.** Use a short window for quick lookups and a long one for builds or deep research. Use `0` when you genuinely want the agent to run until done — you can always stop it.
+- **Do not poll.** `delegation_status()` is instant and cheap. `<task-notification>` will arrive automatically on completion.
+- **Peek before steering.** Read the live transcript with `delegation_peek` to understand what the agent is doing before sending a correction. Steering without evidence often misdirects rather than corrects.
+- **Read results via `delegation_read`.** Do not try to reconstruct output from status or peek; the full persisted markdown is always available once the delegation reaches a terminal state.
+- **Enable strict read-only mode when undo safety matters.** If you need to guarantee that background work does not touch the filesystem outside OpenCode's undo tree, set `BACKGROUND_AGENTS_STRICT_READONLY=1`.
+
+## Monitoring
+
+Besides `delegation_status()`, you can navigate sub-agent sessions directly in the TUI:
 
 | Shortcut | Action |
 |----------|--------|
@@ -121,27 +141,28 @@ Besides `delegation_status()`, you can navigate sub-agent sessions in the TUI:
 | `Ctrl+X Left` | Previous sub-agent |
 | `Ctrl+X Right` | Next sub-agent |
 
-Navigating into a running child session is read-only — use `delegation_steer` to actually talk to it.
+Navigating into a running child session is read-only. Use `delegation_steer` to actually send instructions to it.
 
-## Lifecycle Behavior
-
-The plugin mirrors Claude Code-style background-agent lifecycle behavior within OpenCode plugin boundaries:
+## Lifecycle and reliability
 
 - Stable delegation IDs are reused across state, artifact path, notifications, and retrieval.
-- Explicit lifecycle transitions (`registered` → `running` → terminal).
-- Terminal-state protection: late progress events cannot regress a terminal status.
-- Persistence happens before terminal notification delivery.
-- `delegation_read(id)` blocks until terminal/timeout and returns deterministic terminal info with a persisted fallback.
+- Explicit lifecycle transitions: `registered` → `running` → terminal state.
+- Terminal-state protection: late progress events cannot regress a completed or stopped delegation.
+- Results are persisted before terminal notification delivery.
 - Compaction carries forward running and unread completed delegations with retrieval hints.
+- **Restart recovery.** Active delegations are mirrored to `<id>.state.json` beside their artifact. On plugin start, orphaned state files are re-adopted and reconciled against the server: sessions still running resume normally (steer, stop, status, and read all work again); settled sessions are finalized from their messages so the parent still receives its notification.
 
-This is plugin-level lifecycle parity, not runtime-internal parity. It does not replicate OpenCode's internal task queue, notification-priority controls, or native undo/branching for write-capable background execution.
+This is plugin-level lifecycle parity. It does not replicate OpenCode's internal task queue, notification-priority controls, or native undo/branching for write-capable background execution.
 
 ## Development
 
 ```bash
-npm install      # install dev dependencies
+npm install        # install dev dependencies
 npm run typecheck
+bun test           # unit + property-based (fast-check) test suite
 ```
+
+The test suite covers the full delegation lifecycle against a fake OpenCode client (async dispatch, completion notifications, native and fallback steering, stop, timeout vs unlimited runs, peek, crash-recovery restore), native-steer capability detection, and fuzzing of the state serializer and metadata fallback.
 
 ## FAQ
 
@@ -149,13 +170,17 @@ npm run typecheck
 Each delegation is auto-tagged with a title and summary when it completes, so `delegation_list()` shows described entries rather than opaque IDs.
 
 **Does this persist after the session ends?**
-Yes. Results are saved to disk and survive compaction, restarts, and crashes. New sessions start fresh, but the files remain on disk.
+Yes. Results are saved to disk and survive compaction, restarts, and crashes. Delegations that were still running when OpenCode exited are re-adopted on the next start and finalized normally.
 
 **Does this bloat my context?**
 The opposite — heavy work runs in a separate session, and only the distilled result returns when you call `delegation_read()`.
 
 **Can write-capable agents run in the background?**
 Yes, by default. Their changes live outside OpenCode's undo/branching tree and cannot be reverted via the UI. Set `BACKGROUND_AGENTS_STRICT_READONLY=1` to forbid this.
+
+## Credits
+
+The core concept — async fire-and-forget delegation with disk-persisted results — comes from [kdcokenny/opencode-background-agents](https://github.com/kdcokenny/opencode-background-agents). The underlying delegation engine is based on [oh-my-opencode](https://github.com/code-yeongyu/oh-my-opencode) by @code-yeongyu (MIT). This project extends both with interactive supervisor control and lifecycle reliability.
 
 ## Disclaimer
 

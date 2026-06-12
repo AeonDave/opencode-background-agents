@@ -16,17 +16,20 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import type { Plugin } from "@opencode-ai/plugin"
-import type { Event, Part } from "@opencode-ai/sdk"
+import type { Event } from "@opencode-ai/sdk"
 import { parseAgentMode, parseAgentWriteCapability } from "./agent-capability"
 import { formatDelegationContext } from "./context"
 import { DelegationManager } from "./delegation-manager"
 import { createLogger } from "./logger"
+import { createNativeSteer } from "./native"
 import { getProjectId } from "./primitives/get-project-id"
 import type { OpencodeClient } from "./primitives/types"
 import { DELEGATION_RULES } from "./rules"
+import { deserializeDelegation, serializeDelegation } from "./state"
 import {
 	createDelegate,
 	createDelegationList,
+	createDelegationPeek,
 	createDelegationRead,
 	createDelegationStatus,
 	createDelegationSteer,
@@ -50,21 +53,31 @@ const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 
 	// Project-level storage directory (shared across sessions)
 	// Uses git root commit hash for cross-worktree consistency
-	const projectId = await getProjectId(directory)
+	const projectId = await getProjectId(directory, client as OpencodeClient)
 	const baseDir = path.join(os.homedir(), ".local", "share", "opencode", "delegations", projectId)
 
 	// Ensure base directory exists (for debug logs etc)
 	await fs.mkdir(baseDir, { recursive: true })
 
-	const manager = new DelegationManager(client as OpencodeClient, baseDir, log)
+	// Native server-side steering (opencode >= 1.17 exposes serverUrl and the v2 prompt
+	// route with delivery:"steer"). Older hosts: undefined → v1 fallback inside the manager.
+	const serverUrl = (ctx as { serverUrl?: URL }).serverUrl
+	const nativeSteer = serverUrl ? createNativeSteer(serverUrl, log) : undefined
+
+	const manager = new DelegationManager(client as OpencodeClient, baseDir, log, { nativeSteer })
 
 	await manager.debugLog("BackgroundAgentsPlugin initialized with delegation system")
+
+	// Re-adopt delegations orphaned by a previous process exit (fire-and-forget so plugin
+	// load is never delayed; reconciliation settles them as the server responds).
+	void manager.restoreActiveDelegations()
 
 	return {
 		tool: {
 			delegate: createDelegate(manager),
 			delegation_read: createDelegationRead(manager),
 			delegation_list: createDelegationList(manager),
+			delegation_peek: createDelegationPeek(manager),
 			delegation_steer: createDelegationSteer(manager),
 			delegation_stop: createDelegationStop(manager),
 			delegation_status: createDelegationStatus(manager),
@@ -129,7 +142,7 @@ const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 		// Deliver queued parent notifications on the next user turn if direct delivery failed.
 		"chat.message": async (
 			input: { sessionID?: string },
-			output: { parts?: Array<{ type: string; text?: string }> },
+			output: { message?: { id?: string }; parts?: Array<{ type: string; text?: string }> },
 		) => {
 			if (!input.sessionID) return
 			manager.injectPendingNotificationsIntoChatMessage(output, input.sessionID)
@@ -187,22 +200,18 @@ const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 				}
 			}
 
+			// message.updated carries only the message info (no parts): use it as a heartbeat.
 			if (event.type === "message.updated") {
-				const eventProperties = event.properties as {
-					info: { sessionID?: string; role?: string }
-					parts?: Part[]
-				}
-				const sessionID = eventProperties.info.sessionID
+				const sessionID = event.properties.info.sessionID
 				if (sessionID) {
-					const messageText =
-						eventProperties.info.role === "assistant"
-							? (eventProperties.parts
-									?.filter((part) => part.type === "text")
-									.map((part) => part.text)
-									.join("\n") ?? undefined)
-							: undefined
-					manager.handleMessageEvent(sessionID, messageText)
+					manager.handleMessageEvent(sessionID)
 				}
+			}
+
+			// Part-level updates carry the actual content: text for lastMessage,
+			// tool parts for the tool-call counter, and a heartbeat either way.
+			if (event.type === "message.part.updated") {
+				manager.handlePartEvent(event.properties.part)
 			}
 		},
 	}
@@ -212,6 +221,8 @@ const BackgroundAgentsPluginWithInternals = Object.assign(BackgroundAgentsPlugin
 	testInternals: {
 		DelegationManager,
 		formatDelegationContext,
+		serializeDelegation,
+		deserializeDelegation,
 	},
 } as const)
 

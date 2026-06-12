@@ -28,7 +28,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
   },
   "dependencies": {
     "unique-names-generator": "^4.7.1"
@@ -46,9 +47,10 @@
     }
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "latest",
-    "@opencode-ai/sdk": "latest",
+    "@opencode-ai/plugin": "^1.17.4",
+    "@opencode-ai/sdk": "^1.17.4",
     "@types/bun": "latest",
+    "fast-check": "^4.8.0",
     "typescript": "latest"
   }
 }

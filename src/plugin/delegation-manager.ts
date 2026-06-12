@@ -6,16 +6,19 @@ import { generateReadableId } from "./id"
 import type { Logger } from "./logger"
 import { generateMetadata } from "./metadata"
 import type { OpencodeClient } from "./primitives/types"
+import { deserializeDelegation, isRestorableState, serializeDelegation } from "./state"
 import {
 	ALL_COMPLETE_QUIET_PERIOD_MS,
 	COMPLETE_DEBOUNCE_MS,
 	DEFAULT_MAX_RUN_TIME_MS,
 	isActiveStatus,
 	isTerminalStatus,
+	isUnlimitedRunTime,
 	normalizeId,
 	PARENT_NOTIFICATION_TIMEOUT_MS,
 	parsePersistedStatus,
 	READ_POLL_INTERVAL_MS,
+	READ_WAIT_UNLIMITED_MS,
 	STALL_CHECK_MS,
 	STOP_GRACE_MS,
 	STRICT_READONLY,
@@ -25,15 +28,12 @@ import {
 import type {
 	AssistantSessionMessageItem,
 	DelegateInput,
-	DelegationArtifactState,
 	DelegationListItem,
 	DelegationManagerOptions,
-	DelegationNotificationState,
-	DelegationProgress,
 	DelegationRecord,
-	DelegationRetrievalState,
 	DelegationStatus,
 	DelegationTerminalStatus,
+	NativeSteerFn,
 	ParentNotificationState,
 	SessionMessageItem,
 } from "./types"
@@ -44,9 +44,9 @@ class DelegationManager {
 	private terminalWaiters: Map<string, { promise: Promise<void>; resolve: () => void }> = new Map()
 	private timeoutTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
 	private completeTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
-	// Steers that could not be delivered immediately (session busy) are queued here and
-	// flushed on the next progress/idle signal so an instruction is never silently dropped.
-	private steerQueue: Map<string, string[]> = new Map()
+	// Unique tool callIDs seen per delegation: part events fire repeatedly for the same
+	// call (pending → running → completed), so the Set dedupes the toolCalls counter.
+	private toolCallsSeen: Map<string, Set<string>> = new Map()
 	private watchdogTimer?: ReturnType<typeof setInterval>
 	private client: OpencodeClient
 	private baseDir: string
@@ -55,8 +55,11 @@ class DelegationManager {
 	private readPollIntervalMs: number
 	private terminalWaitGraceMs: number
 	private allCompleteQuietPeriodMs: number
+	private completeDebounceMs: number
+	private readWaitUnlimitedMs: number
 	private idGenerator: () => string
 	private metadataGenerator: typeof generateMetadata
+	private nativeSteer?: NativeSteerFn
 	private pendingByParent: Map<string, Set<string>> = new Map()
 	private parentNotificationState: Map<string, ParentNotificationState> = new Map()
 	private pendingNotifications: Map<string, string[]> = new Map()
@@ -74,8 +77,11 @@ class DelegationManager {
 		this.readPollIntervalMs = options.readPollIntervalMs ?? READ_POLL_INTERVAL_MS
 		this.terminalWaitGraceMs = options.terminalWaitGraceMs ?? TERMINAL_WAIT_GRACE_MS
 		this.allCompleteQuietPeriodMs = options.allCompleteQuietPeriodMs ?? ALL_COMPLETE_QUIET_PERIOD_MS
+		this.completeDebounceMs = options.completeDebounceMs ?? COMPLETE_DEBOUNCE_MS
+		this.readWaitUnlimitedMs = options.readWaitUnlimitedMs ?? READ_WAIT_UNLIMITED_MS
 		this.idGenerator = options.idGenerator ?? generateReadableId
 		this.metadataGenerator = options.metadataGenerator ?? generateMetadata
+		this.nativeSteer = options.nativeSteer
 		this.startWatchdog()
 	}
 
@@ -94,6 +100,112 @@ class DelegationManager {
 		// Node/Bun timers expose unref(); the DOM `number` fallback does not. Cast structurally
 		// so this compiles in the facade repo (no @types/node) and at runtime under opencode.
 		;(this.watchdogTimer as unknown as { unref?: () => void }).unref?.()
+	}
+
+	// ----- State persistence & restart recovery -----
+
+	private stateFilePath(delegation: DelegationRecord): string {
+		return delegation.artifact.filePath.replace(/\.md$/, ".state.json")
+	}
+
+	/**
+	 * Mirror an ACTIVE delegation to disk (fire-and-forget). The state file only exists
+	 * while the delegation is running: it is deleted on finalization, so any state file
+	 * found at startup marks a delegation orphaned by a process exit.
+	 */
+	private persistState(id: string): void {
+		const delegation = this.delegations.get(id)
+		if (!delegation || isTerminalStatus(delegation.status)) return
+		void fs
+			.writeFile(this.stateFilePath(delegation), serializeDelegation(delegation), "utf8")
+			.catch((error: Error) => {
+				void this.debugLog(`persistState failed for ${id}: ${error.message}`)
+			})
+	}
+
+	private removeStateFile(delegation: DelegationRecord): void {
+		void fs.unlink(this.stateFilePath(delegation)).catch(() => {})
+	}
+
+	/**
+	 * Re-adopt delegations that were active when the previous process exited, then
+	 * reconcile them against the server: sessions still busy keep running (events and
+	 * the watchdog take over — the original prompt promise is gone); settled sessions
+	 * are finalized from their messages so the parent still gets its notification.
+	 */
+	async restoreActiveDelegations(): Promise<void> {
+		let rootDirs: string[]
+		try {
+			const entries = await fs.readdir(this.baseDir, { withFileTypes: true })
+			rootDirs = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name)
+		} catch {
+			return
+		}
+
+		const restored: DelegationRecord[] = []
+		for (const dir of rootDirs) {
+			const dirPath = path.join(this.baseDir, dir)
+			let files: string[]
+			try {
+				files = await fs.readdir(dirPath)
+			} catch {
+				continue
+			}
+			for (const file of files.filter((name) => name.endsWith(".state.json"))) {
+				const filePath = path.join(dirPath, file)
+				try {
+					const record = deserializeDelegation(await fs.readFile(filePath, "utf8"))
+					if (!record || !isRestorableState(record)) {
+						void fs.unlink(filePath).catch(() => {})
+						continue
+					}
+					if (this.delegations.has(record.id)) continue
+
+					this.delegations.set(record.id, record)
+					this.delegationsBySession.set(record.sessionID, record.id)
+					this.createTerminalWaiter(record.id)
+					if (!this.pendingByParent.has(record.parentSessionID)) {
+						this.pendingByParent.set(record.parentSessionID, new Set())
+						this.resetParentAllCompleteNotificationCycle(record.parentSessionID)
+					}
+					this.pendingByParent.get(record.parentSessionID)?.add(record.id)
+					// Join the restored batch to the parent's current notification cycle so the
+					// all-complete signal fires once the batch settles.
+					const parentState = this.getParentNotificationState(record.parentSessionID)
+					record.notificationCycle = parentState.allCompleteCycle
+					record.notificationCycleToken = parentState.allCompleteCycleToken
+					this.scheduleTimeout(record.id)
+					restored.push(record)
+				} catch (error) {
+					await this.debugLog(
+						`restoreActiveDelegations: failed to restore ${filePath}: ${
+							error instanceof Error ? error.message : String(error)
+						}`,
+					)
+				}
+			}
+		}
+
+		if (restored.length === 0) return
+		await this.debugLog(
+			`restoreActiveDelegations: re-adopted ${restored.length} delegation(s): ${restored
+				.map((r) => r.id)
+				.join(", ")}`,
+		)
+
+		const statuses = await this.fetchSessionStatuses()
+		// Status unavailable: leave everything running; the watchdog reconciles as soon as
+		// the server responds (restored heartbeats are old, so the stall check fires fast).
+		if (!statuses) return
+
+		for (const record of restored) {
+			const type = statuses[record.sessionID]?.type
+			if (type === "busy" || type === "retry") continue
+			await this.debugLog(
+				`restoreActiveDelegations: ${record.id} settled while plugin was down; finalizing`,
+			)
+			this.scheduleComplete(record.id)
+		}
 	}
 
 	/** Stop the watchdog interval (cleanup; safe to call multiple times). */
@@ -118,32 +230,39 @@ class DelegationManager {
 		})
 		if (stalled.length === 0) return
 
-		let statuses: Record<string, { type?: string } | undefined> | undefined
-		try {
-			const result = await this.client.session.status({})
-			statuses = (result.data as { sessions?: Record<string, { type?: string }> } | undefined)
-				?.sessions
-		} catch (error) {
-			await this.debugLog(
-				`runWatchdog: session.status poll failed: ${
-					error instanceof Error ? error.message : String(error)
-				}`,
-			)
-			return
-		}
+		const statuses = await this.fetchSessionStatuses()
 		if (!statuses) return
 
 		for (const delegation of stalled) {
+			// The status map only contains non-idle (busy/retry) sessions: an absent entry
+			// means the session has settled. "busy"/"retry" mean it is still working.
 			const serverStatus = statuses[delegation.sessionID]?.type
-			if (serverStatus === "idle") {
+			if (serverStatus === undefined || serverStatus === "idle") {
 				await this.debugLog(
-					`runWatchdog: ${delegation.id} idle on server but no idle event received; recovering`,
+					`runWatchdog: ${delegation.id} settled on server but no idle event received; recovering`,
 				)
-				await this.settleDelegation(delegation.id)
-			} else if (serverStatus === "error") {
-				await this.debugLog(`runWatchdog: ${delegation.id} reported error on server; finalizing`)
-				await this.finalizeDelegation(delegation.id, "error", "Session reported error")
+				this.scheduleComplete(delegation.id)
 			}
+		}
+	}
+
+	/**
+	 * Fetch the server's session-status map. `/session/status` returns a record keyed
+	 * directly by sessionID that only contains non-idle (busy/retry) sessions — idle
+	 * sessions are evicted, so an absent key means "settled". Returns undefined when the
+	 * poll itself fails, so callers can distinguish "unknown" from "settled".
+	 */
+	private async fetchSessionStatuses(): Promise<Record<string, { type?: string }> | undefined> {
+		try {
+			const result = await this.client.session.status({})
+			return result.data as Record<string, { type?: string }> | undefined
+		} catch (error) {
+			await this.debugLog(
+				`fetchSessionStatuses: session.status poll failed: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			)
+			return undefined
 		}
 	}
 
@@ -217,11 +336,21 @@ class DelegationManager {
 		this.timeoutTimers.delete(id)
 	}
 
+	/**
+	 * (Re)arm the timeout timer from the record's own `timeoutAt`. Used at registration,
+	 * after a delivered steer (which re-opens the window), and when re-adopting restored
+	 * delegations whose deadline may be near or already past. Delegations without a
+	 * deadline (maxRunTimeMs=0) get no timer: the supervisor steers or stops them.
+	 */
 	private scheduleTimeout(id: string): void {
 		this.clearTimeoutTimer(id)
+		const delegation = this.delegations.get(id)
+		if (!delegation || isTerminalStatus(delegation.status)) return
+		if (!delegation.timeoutAt) return
+		const delay = Math.max(delegation.timeoutAt.getTime() - Date.now() + 5_000, 1_000)
 		const timer = setTimeout(() => {
 			void this.handleTimeout(id)
-		}, this.maxRunTimeMs + 5_000)
+		}, delay)
 		this.timeoutTimers.set(id, timer)
 	}
 
@@ -247,7 +376,7 @@ class DelegationManager {
 		const timer = setTimeout(() => {
 			this.completeTimers.delete(id)
 			void this.finalizeDelegation(id, "complete")
-		}, COMPLETE_DEBOUNCE_MS)
+		}, this.completeDebounceMs)
 		this.completeTimers.set(id, timer)
 	}
 
@@ -267,12 +396,11 @@ class DelegationManager {
 	/**
 	 * Steer a running delegation: inject an extra instruction into its live session.
 	 *
-	 * The server can reject a prompt while the session is busy (opencode now returns proper
-	 * busy errors), and a steer mid-LLM-call cannot interrupt that call anyway. So we attempt
-	 * immediate delivery via `promptAsync`; if it is rejected we queue the instruction and
-	 * deliver it at the next turn boundary (idle / settle / watchdog recovery). Either way the
-	 * pending completion is cancelled so the steered turn is awaited and the steer is never
-	 * silently dropped.
+	 * Native-first: opencode >= 1.17 supports server-side steering (v2 prompt with
+	 * `delivery: "steer"`), which injects the instruction into the CURRENT run even while
+	 * the session is busy — the server owns the queueing. On servers without the
+	 * capability we fall back to a v1 `promptAsync`, which can be rejected while the
+	 * session is busy; in that case the supervisor is told to retry (or stop the task).
 	 */
 	async steerDelegation(sessionID: string, id: string, message: string): Promise<string> {
 		const trimmed = message.trim()
@@ -286,112 +414,59 @@ class DelegationManager {
 			return `❌ Delegation "${delegation.id}" is ${delegation.status}; cannot steer a finished task. Use delegation_read("${delegation.id}").`
 		}
 
-		// A steer extends the run: cancel any pending completion so we wait for it.
+		// A steer extends the run: cancel any pending completion so the steered turn is
+		// awaited. Remember whether one was pending — if delivery fails it must be restored,
+		// or a settled delegation would sit in limbo until the watchdog recovers it.
+		const hadPendingComplete = this.completeTimers.has(delegation.id)
 		this.cancelScheduledComplete(delegation.id)
 
 		const text = `[SUPERVISOR STEER] ${trimmed}`
 		let delivered = false
-		try {
-			await this.client.session.promptAsync({
-				path: { id: delegation.sessionID },
-				body: {
-					agent: delegation.agent,
-					parts: [{ type: "text", text }],
-				},
-			})
-			delivered = true
-		} catch (error) {
-			// Most likely a busy-session rejection: queue for delivery at the next boundary.
-			this.enqueueSteer(delegation.id, text)
-			await this.debugLog(
-				`steerDelegation: immediate delivery rejected for ${delegation.id}, queued: ${
-					error instanceof Error ? error.message : String(error)
-				}`,
-			)
-		}
-
-		this.updateDelegation(delegation.id, (record, now) => {
+		if (this.nativeSteer) {
+			delivered = await this.nativeSteer(delegation.sessionID, text)
 			if (delivered) {
-				record.progress.steerCount = (record.progress.steerCount ?? 0) + 1
-				record.progress.lastSteerAt = now
+				await this.debugLog(`steerDelegation: native steer delivered to ${delegation.id}`)
 			}
-			record.progress.lastMessage = `[steer${delivered ? "" : " queued"}] ${trimmed}`
-			record.progress.lastMessageAt = now
-			record.progress.lastHeartbeatAt = now
-		})
-
-		if (delivered) {
-			await this.debugLog(`steerDelegation: injected steer into ${delegation.id}`)
-			return `✅ Steer sent to "${delegation.id}". It will act on your instruction in its current run; a <task-notification> arrives when it reaches a terminal state.`
 		}
-		return `⏳ Steer queued for "${delegation.id}" (session busy). It will be delivered at the next turn boundary; a <task-notification> arrives when it reaches a terminal state.`
-	}
-
-	/** Append a steer to a delegation's pending queue for later delivery. */
-	private enqueueSteer(id: string, text: string): void {
-		const queue = this.steerQueue.get(id) ?? []
-		queue.push(text)
-		this.steerQueue.set(id, queue)
-	}
-
-	/**
-	 * Deliver any queued steers for a delegation. Returns true if at least one was delivered
-	 * (the run has been reopened and should not complete yet). On failure the queue is kept for
-	 * the next attempt. Queued steers for a no-longer-active delegation are discarded.
-	 */
-	private async flushSteerQueue(delegation: DelegationRecord): Promise<boolean> {
-		const queued = this.steerQueue.get(delegation.id)
-		if (!queued || queued.length === 0) return false
-		if (!isActiveStatus(delegation.status)) {
-			this.steerQueue.delete(delegation.id)
-			return false
+		if (!delivered) {
+			try {
+				await this.client.session.promptAsync({
+					path: { id: delegation.sessionID },
+					body: {
+						agent: delegation.agent,
+						parts: [{ type: "text", text }],
+					},
+				})
+				delivered = true
+				await this.debugLog(`steerDelegation: v1 fallback steer delivered to ${delegation.id}`)
+			} catch (error) {
+				await this.debugLog(
+					`steerDelegation: delivery failed for ${delegation.id}: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				)
+			}
 		}
 
-		const text = queued.join("\n\n")
-		try {
-			await this.client.session.promptAsync({
-				path: { id: delegation.sessionID },
-				body: {
-					agent: delegation.agent,
-					parts: [{ type: "text", text }],
-				},
-			})
-		} catch (error) {
-			await this.debugLog(
-				`flushSteerQueue: delivery still failing for ${delegation.id}: ${
-					error instanceof Error ? error.message : String(error)
-				}`,
-			)
-			return false
+		if (!delivered) {
+			if (hadPendingComplete) this.scheduleComplete(delegation.id)
+			return `❌ Steer could not be delivered to "${delegation.id}" right now (session busy and no native steering on this server). Retry in a moment, or delegation_stop("${delegation.id}") and re-delegate with the new instruction.`
 		}
 
-		this.steerQueue.delete(delegation.id)
-		const count = queued.length
 		this.updateDelegation(delegation.id, (record, now) => {
-			record.progress.steerCount = (record.progress.steerCount ?? 0) + count
+			record.progress.steerCount = (record.progress.steerCount ?? 0) + 1
 			record.progress.lastSteerAt = now
-			record.progress.lastHeartbeatAt = now
-			record.progress.lastMessage = `[steer x${count}] ${text.slice(0, 120)}`
+			record.progress.lastMessage = `[steer] ${trimmed}`
 			record.progress.lastMessageAt = now
+			record.progress.lastHeartbeatAt = now
+			// A steer extends the run, so it also gets a fresh timeout window.
+			if (!isUnlimitedRunTime(record.maxRunTimeMs)) {
+				record.timeoutAt = new Date(now.getTime() + record.maxRunTimeMs)
+			}
 		})
-		await this.debugLog(`flushSteerQueue: delivered ${count} queued steer(s) to ${delegation.id}`)
-		return true
-	}
-
-	/**
-	 * Called when a delegation's session appears to have settled (prompt resolved, idle event,
-	 * or watchdog-confirmed idle). Flushes any queued steers first: a delivered steer reopens
-	 * the run, so we skip completion and wait for the next settle. Otherwise the debounced
-	 * completion is scheduled as usual.
-	 */
-	private async settleDelegation(id: string): Promise<void> {
-		const delegation = this.delegations.get(id)
-		if (!delegation || isTerminalStatus(delegation.status)) return
-		if (await this.flushSteerQueue(delegation)) {
-			this.cancelScheduledComplete(id)
-			return
-		}
-		this.scheduleComplete(id)
+		this.scheduleTimeout(delegation.id)
+		this.persistState(delegation.id)
+		return `✅ Steer sent to "${delegation.id}". It will act on your instruction in its current run; a <task-notification> arrives when it reaches a terminal state.`
 	}
 
 	/**
@@ -410,7 +485,6 @@ class DelegationManager {
 		}
 
 		this.cancelScheduledComplete(delegation.id)
-		this.steerQueue.delete(delegation.id)
 		try {
 			await this.client.session.abort({ path: { id: delegation.sessionID } })
 		} catch (error) {
@@ -442,26 +516,99 @@ class DelegationManager {
 
 	/**
 	 * Best-effort check that a session is no longer running after an abort. Polls
-	 * `session.status` over a short grace window. Returns true once the server reports the
-	 * session as anything other than "busy", or if status cannot be read (we then fall back to
-	 * the force-delete path rather than assume success).
+	 * `session.status` over a short grace window. The status map only contains non-idle
+	 * sessions, so an absent entry (or explicit "idle") confirms the stop; "busy"/"retry"
+	 * mean it is still running. If status cannot be read we return false and fall back to
+	 * the force-delete path rather than assume success.
 	 */
 	private async confirmSessionStopped(sessionID: string): Promise<boolean> {
 		const deadline = Date.now() + STOP_GRACE_MS
 		while (Date.now() < deadline) {
-			try {
-				const result = await this.client.session.status({})
-				const sessions = (
-					result.data as { sessions?: Record<string, { type?: string }> } | undefined
-				)?.sessions
-				const type = sessions?.[sessionID]?.type
-				if (type !== "busy") return true
-			} catch {
-				return false
-			}
+			const statuses = await this.fetchSessionStatuses()
+			if (!statuses) return false
+			const type = statuses[sessionID]?.type
+			if (type === undefined || type === "idle") return true
 			await new Promise((resolve) => setTimeout(resolve, 250))
 		}
 		return false
+	}
+
+	/**
+	 * Non-blocking snapshot of a RUNNING delegation's transcript so the supervisor can make
+	 * mid-run decisions (steer, stop, or let it continue) without waiting for the terminal
+	 * state. Read-only: no lifecycle side effects, does not count as retrieval.
+	 */
+	async peekDelegation(sessionID: string, id: string): Promise<string> {
+		const delegation = await this.resolveVisibleDelegation(sessionID, id)
+		if (!delegation) {
+			return `❌ Delegation "${normalizeId(id)}" not found in this session. Use delegation_status().`
+		}
+		if (isTerminalStatus(delegation.status)) {
+			return `ℹ️ Delegation "${delegation.id}" is ${delegation.status}; use delegation_read("${delegation.id}") for the full result.`
+		}
+
+		let messageData: SessionMessageItem[] | undefined
+		try {
+			const messages = await this.client.session.messages({
+				path: { id: delegation.sessionID },
+			})
+			messageData = messages.data as SessionMessageItem[] | undefined
+		} catch (error) {
+			return `⚠️ Could not read live transcript for "${delegation.id}": ${
+				error instanceof Error ? error.message : "Unknown error"
+			}. It is still running; try again or rely on the <task-notification>.`
+		}
+
+		// Build a transcript digest: assistant text, tool activity, and steers.
+		const MAX_TEXT_BLOCK = 700
+		const MAX_DIGEST = 4_000
+		const lines: string[] = []
+		for (const message of messageData ?? []) {
+			const role = message.info.role
+			for (const part of message.parts) {
+				if (part.type === "text") {
+					const text = part.text.trim()
+					if (!text) continue
+					if (role === "assistant") {
+						lines.push(
+							text.length > MAX_TEXT_BLOCK ? `${text.slice(0, MAX_TEXT_BLOCK)} […]` : text,
+						)
+					} else if (text.startsWith("[SUPERVISOR STEER]")) {
+						lines.push(`>> ${text.slice(0, 200)}`)
+					}
+					// Other user text is the original prompt; the supervisor already knows it.
+					continue
+				}
+				if (part.type === "tool") {
+					const state = part.state
+					const title =
+						(state.status === "running" || state.status === "completed") && state.title
+							? `: ${state.title}`
+							: ""
+					const error = state.status === "error" ? ` — ${state.error.slice(0, 160)}` : ""
+					lines.push(`[tool] ${part.tool} (${state.status})${title}${error}`)
+				}
+			}
+		}
+
+		// Tail-biased trim: the most recent activity is what decisions are made on.
+		let digest = lines.join("\n")
+		if (digest.length > MAX_DIGEST) {
+			digest = `[… earlier activity trimmed …]\n${digest.slice(-MAX_DIGEST)}`
+		}
+		if (!digest) {
+			digest = "(no visible activity yet — the agent may still be on its first model call)"
+		}
+
+		const now = Date.now()
+		const elapsed = Math.round((now - (delegation.startedAt ?? delegation.createdAt).getTime()) / 1000)
+		const deadline = delegation.timeoutAt
+			? `timeout in ${Math.max(Math.round((delegation.timeoutAt.getTime() - now) / 1000), 0)}s`
+			: "no timeout"
+		const header = `## Peek: ${delegation.id} [${delegation.status}] agent=${delegation.agent}\nelapsed=${elapsed}s · ${deadline} · tools=${delegation.progress.toolCalls} · steers=${delegation.progress.steerCount ?? 0}`
+		const footer = `Act on it: delegation_steer("${delegation.id}", …) · delegation_stop("${delegation.id}") · or wait for the <task-notification>. Do not poll peek in a loop.`
+
+		return `${header}\n\n${digest}\n\n${footer}`
 	}
 
 	/** Human-readable status of active (and unread completed) delegations in scope. */
@@ -482,16 +629,15 @@ class DelegationManager {
 
 		const lines = running.map((d) => {
 			const elapsed = Math.round((now - (d.startedAt ?? d.createdAt).getTime()) / 1000)
+			const deadline = d.timeoutAt
+				? `timeout in ${Math.max(Math.round((d.timeoutAt.getTime() - now) / 1000), 0)}s`
+				: "no timeout"
 			const parts = [
 				`- **${d.id}** [${d.status}] agent=${d.agent}`,
-				`  elapsed=${elapsed}s · tools=${d.progress.toolCalls} · heartbeat=${age(d.progress.lastHeartbeatAt)}`,
+				`  elapsed=${elapsed}s · ${deadline} · tools=${d.progress.toolCalls} · heartbeat=${age(d.progress.lastHeartbeatAt)}`,
 			]
 			if (d.progress.steerCount) {
 				parts.push(`  steers=${d.progress.steerCount} (last ${age(d.progress.lastSteerAt)})`)
-			}
-			const queued = this.steerQueue.get(d.id)?.length ?? 0
-			if (queued > 0) {
-				parts.push(`  ⏳ ${queued} steer(s) queued (awaiting next turn boundary)`)
 			}
 			if (d.progress.lastMessage) parts.push(`  last: ${d.progress.lastMessage.slice(0, 120)}`)
 			return parts.join("\n")
@@ -522,6 +668,7 @@ class DelegationManager {
 		prompt: string
 		agent: string
 		artifactPath: string
+		maxRunTimeMs?: number
 	}): DelegationRecord {
 		if (!this.pendingByParent.has(input.parentSessionID)) {
 			this.pendingByParent.set(input.parentSessionID, new Set())
@@ -533,6 +680,7 @@ class DelegationManager {
 		const notificationCycleToken = parentNotificationState.allCompleteCycleToken
 
 		const now = new Date()
+		const maxRunTimeMs = input.maxRunTimeMs ?? this.maxRunTimeMs
 		const delegation: DelegationRecord = {
 			id: input.id,
 			rootSessionID: input.rootSessionID,
@@ -547,7 +695,10 @@ class DelegationManager {
 			status: "registered",
 			createdAt: now,
 			updatedAt: now,
-			timeoutAt: new Date(now.getTime() + this.maxRunTimeMs),
+			timeoutAt: isUnlimitedRunTime(maxRunTimeMs)
+				? undefined
+				: new Date(now.getTime() + maxRunTimeMs),
+			maxRunTimeMs,
 			progress: {
 				toolCalls: 0,
 				lastUpdateAt: now,
@@ -568,6 +719,7 @@ class DelegationManager {
 		this.delegationsBySession.set(delegation.sessionID, delegation.id)
 		this.createTerminalWaiter(delegation.id)
 		this.pendingByParent.get(delegation.parentSessionID)?.add(delegation.id)
+		this.persistState(delegation.id)
 
 		return delegation
 	}
@@ -630,7 +782,7 @@ class DelegationManager {
 
 		this.clearTimeoutTimer(id)
 		this.cancelScheduledComplete(id)
-		this.steerQueue.delete(id)
+		this.toolCallsSeen.delete(id)
 		this.resolveTerminalWaiter(id)
 
 		return { transitioned: true, delegation }
@@ -750,9 +902,29 @@ class DelegationManager {
 		state.allCompleteNotifiedCycle = cycle
 		state.allCompleteNotifiedCycleToken = cycleToken
 
+		void this.showToast("All delegations complete.", "success")
+
 		await this.debugLog(
 			`all-complete notification ${deliveryStatus} for ${parentSessionID} cycle=${cycleToken}`,
 		)
+	}
+
+	/**
+	 * Best-effort TUI toast so the human sees delegation lifecycle events. The model-facing
+	 * notifications are synthetic parts the TUI hides, so this is the human-facing channel.
+	 * Silently no-ops when no TUI is attached (headless / SDK-driven sessions).
+	 */
+	private async showToast(
+		message: string,
+		variant: "info" | "success" | "warning" | "error",
+	): Promise<void> {
+		try {
+			await this.client.tui.showToast({
+				body: { title: "Background agents", message, variant },
+			})
+		} catch {
+			// No TUI attached; nothing to do.
+		}
 	}
 
 	private queuePendingNotification(parentSessionID: string, notification: string): void {
@@ -784,7 +956,9 @@ class DelegationManager {
 						body: {
 							noReply,
 							agent: parentAgent,
-							parts: [{ type: "text", text: notification }],
+							// synthetic: visible to the model, hidden by the TUI — the human
+							// is informed via a toast instead of raw notification XML.
+							parts: [{ type: "text", text: notification, synthetic: true }],
 						},
 					})
 					.then(() => "sent" as const),
@@ -814,7 +988,10 @@ class DelegationManager {
 	}
 
 	injectPendingNotificationsIntoChatMessage(
-		output: { parts?: Array<{ type: string; text?: string }> },
+		output: {
+			message?: { id?: string }
+			parts?: Array<{ type: string; text?: string }>
+		},
 		sessionID: string,
 	): void {
 		const pending = this.pendingNotifications.get(sessionID)
@@ -823,15 +1000,18 @@ class DelegationManager {
 		this.pendingNotifications.delete(sessionID)
 		const notificationText = pending.join("\n\n")
 		const parts = output.parts ?? []
-		const firstTextPart = parts.find((part) => part.type === "text")
 
-		if (firstTextPart) {
-			firstTextPart.text = `${notificationText}\n\n${firstTextPart.text ?? ""}`
-			output.parts = parts
-			return
-		}
-
-		output.parts = [{ type: "text", text: notificationText }, ...parts]
+		// Append as a separate synthetic part: the model sees it, the TUI hides it, and the
+		// user's own text is left untouched. Part IDs only need the "prt" prefix to validate.
+		parts.push({
+			id: `prt_bg${Date.now().toString(16)}${Math.random().toString(36).slice(2, 10)}`,
+			sessionID,
+			messageID: output.message?.id,
+			type: "text",
+			text: notificationText,
+			synthetic: true,
+		} as { type: string; text?: string })
+		output.parts = parts
 	}
 
 	private markRetrieved(id: string, readerSessionID: string): DelegationRecord | undefined {
@@ -900,14 +1080,19 @@ class DelegationManager {
 	}
 
 	private buildTerminalNotification(delegation: DelegationRecord, remainingCount: number): string {
+		// Title/description/error can come from arbitrary agent output: collapse to a single
+		// line so the notification XML never contains broken markdown or multi-line dumps.
+		const singleLine = (s: string) => s.replace(/\s+/g, " ").trim()
+		const title = delegation.title ? singleLine(delegation.title) : ""
+		const description = delegation.description ? singleLine(delegation.description) : ""
 		const lines = [
 			"<task-notification>",
 			`<task-id>${delegation.id}</task-id>`,
 			`<status>${delegation.status}</status>`,
-			`<summary>Background agent ${delegation.status}: ${delegation.title || delegation.id}</summary>`,
-			delegation.title ? `<title>${delegation.title}</title>` : "",
-			delegation.description ? `<description>${delegation.description}</description>` : "",
-			delegation.error ? `<error>${delegation.error}</error>` : "",
+			`<summary>Background agent ${delegation.status}: ${title || delegation.id}</summary>`,
+			title ? `<title>${title}</title>` : "",
+			description ? `<description>${description}</description>` : "",
+			delegation.error ? `<error>${singleLine(delegation.error)}</error>` : "",
 			`<artifact>${delegation.artifact.filePath}</artifact>`,
 			`<retrieval>Use delegation_read("${delegation.id}") for full output.</retrieval>`,
 			remainingCount > 0 ? `<remaining>${remainingCount}</remaining>` : "",
@@ -1021,6 +1206,9 @@ class DelegationManager {
 
 		await this.persistOutput(delegation, resolvedResult)
 		await this.notifyParent(delegation.id)
+		// Last step: with the artifact persisted and the parent notified, the delegation no
+		// longer needs crash recovery. (A crash before this point re-finalizes on restart.)
+		this.removeStateFile(delegation)
 	}
 
 	private async notifyParent(delegationId: string): Promise<void> {
@@ -1044,6 +1232,18 @@ class DelegationManager {
 			)
 
 			this.markNotified(delegation.id)
+
+			const toastVariant =
+				delegation.status === "complete"
+					? ("success" as const)
+					: delegation.status === "error"
+						? ("error" as const)
+						: ("warning" as const)
+			void this.showToast(
+				`Delegation ${delegation.id} ${delegation.status}${delegation.title ? `: ${delegation.title}` : ""}`,
+				toastVariant,
+			)
+
 			this.scheduleAllCompleteForParent(delegation.parentSessionID, delegation.parentAgent)
 
 			await this.debugLog(
@@ -1131,11 +1331,13 @@ class DelegationManager {
 			prompt: input.prompt,
 			agent: input.agent,
 			artifactPath,
+			maxRunTimeMs: input.maxRunTimeMs,
 		})
 
 		await this.debugLog(`Registered delegation ${delegation.id} before execution`)
 		this.scheduleTimeout(delegation.id)
 		this.markStarted(delegation.id)
+		this.persistState(delegation.id)
 
 		// Fire the prompt (using prompt() instead of promptAsync() to properly initialize agent loop)
 		// Agent param is critical for MCP tools - tells OpenCode which agent's config to use
@@ -1153,6 +1355,7 @@ class DelegationManager {
 						delegation_steer: false,
 						delegation_stop: false,
 						delegation_status: false,
+						delegation_peek: false,
 						delegation_read: false,
 						delegation_list: false,
 						todowrite: false,
@@ -1161,7 +1364,7 @@ class DelegationManager {
 				},
 			})
 			.then(() => {
-				void this.settleDelegation(delegation.id)
+				this.scheduleComplete(delegation.id)
 			})
 			.catch((error: Error) => {
 				void this.finalizeDelegation(delegation.id, "error", error.message)
@@ -1191,19 +1394,21 @@ class DelegationManager {
 		await this.finalizeDelegation(
 			delegation.id,
 			"timeout",
-			`Delegation timed out after ${this.maxRunTimeMs / 1000}s`,
+			`Delegation timed out after ${Math.round(delegation.maxRunTimeMs / 1000)}s`,
 		)
 	}
 
 	/**
-	 * Handle session.idle event - called when a session becomes idle
+	 * Handle session.idle event - called when a session becomes idle. Schedules the
+	 * debounced completion; a native steer delivered in the window re-busies the session
+	 * and the steer handler cancels the pending completion.
 	 */
 	async handleSessionIdle(sessionID: string): Promise<void> {
 		const delegation = this.findBySession(sessionID)
 		if (!delegation || isTerminalStatus(delegation.status)) return
 
 		await this.debugLog(`handleSessionIdle for delegation ${delegation.id}`)
-		await this.settleDelegation(delegation.id)
+		this.scheduleComplete(delegation.id)
 	}
 
 	/**
@@ -1341,10 +1546,14 @@ ${description}
 		}
 
 		if (isActiveStatus(delegation.status)) {
-			const remainingMs = Math.max(
-				delegation.timeoutAt.getTime() - Date.now() + this.terminalWaitGraceMs,
-				this.readPollIntervalMs,
-			)
+			// With a deadline, wait until it (plus grace). Without one, read cannot block a
+			// tool call forever: wait a bounded window, then defer to the <task-notification>.
+			const remainingMs = delegation.timeoutAt
+				? Math.max(
+						delegation.timeoutAt.getTime() - Date.now() + this.terminalWaitGraceMs,
+						this.readPollIntervalMs,
+					)
+				: this.readWaitUnlimitedMs
 
 			await this.debugLog(
 				`readOutput: waiting up to ${remainingMs}ms for delegation ${delegation.id} to reach terminal state`,
@@ -1352,7 +1561,12 @@ ${description}
 
 			const waitResult = await this.waitForTerminal(delegation.id, remainingMs)
 			if (waitResult === "timeout" && isActiveStatus(delegation.status)) {
-				await this.handleTimeout(delegation.id)
+				// Only delegations with a deadline are force-timed-out; an unlimited
+				// delegation just keeps running and the caller is told to await the
+				// notification.
+				if (delegation.timeoutAt) {
+					await this.handleTimeout(delegation.id)
+				}
 			}
 		}
 
@@ -1479,6 +1693,8 @@ ${description}
 			this.clearTimeoutTimer(delegation.id)
 			this.terminalWaiters.delete(delegation.id)
 			this.delegationsBySession.delete(delegation.sessionID)
+			this.toolCallsSeen.delete(delegation.id)
+			this.removeStateFile(delegation)
 			this.delegations.delete(delegation.id)
 		}
 
@@ -1507,6 +1723,35 @@ ${description}
 		const delegation = this.findBySession(sessionID)
 		if (!delegation) return
 		this.markProgress(delegation.id, messageText)
+	}
+
+	/**
+	 * Handle message.part.updated events for progress tracking: heartbeat on any part
+	 * activity, lastMessage from streamed text parts, and a deduped tool-call counter
+	 * (the `message.updated` event does not carry parts, so this is the only place
+	 * tool activity is visible to the plugin).
+	 */
+	handlePartEvent(part: Part): void {
+		const delegation = this.findBySession(part.sessionID)
+		if (!delegation || isTerminalStatus(delegation.status)) return
+
+		if (part.type === "tool") {
+			let seen = this.toolCallsSeen.get(delegation.id)
+			if (!seen) {
+				seen = new Set()
+				this.toolCallsSeen.set(delegation.id, seen)
+			}
+			seen.add(part.callID)
+			const toolCalls = seen.size
+			this.markProgress(delegation.id)
+			this.updateDelegation(delegation.id, (record) => {
+				record.progress.toolCalls = toolCalls
+			})
+			return
+		}
+
+		const text = part.type === "text" && part.text.trim().length > 0 ? part.text : undefined
+		this.markProgress(delegation.id, text)
 	}
 
 	/**
