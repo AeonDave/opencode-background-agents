@@ -335,6 +335,44 @@ describe("completion and notifications", () => {
 		).toBe(false)
 	})
 
+	test("the LAST completion stays silent and all-complete delivers exactly one final wake", async () => {
+		// Boundary of the wake fix: across a full batch the supervisor must be woken exactly
+		// TWICE — once by the first completion (siblings remained) and once by all-complete —
+		// never a third time. The last completion itself (remaining === 0) must stay silent
+		// (noReply=true) so it does not double-wake alongside all-complete.
+		const { manager, state } = await setup()
+		const first = await manager.delegate(delegateInput())
+		const second = await manager.delegate(delegateInput())
+
+		state.promptResolvers.get(first.sessionID)?.resolve({})
+		await waitFor(() => first.status === "complete")
+		state.promptResolvers.get(second.sessionID)?.resolve({})
+		await waitFor(() => second.status === "complete")
+
+		// Wait until the all-complete wake has been dispatched.
+		await waitFor(() =>
+			state.promptAsyncCalls.some((c) => c.body.parts[0]?.text?.includes("all-complete")),
+		)
+
+		const wakeText = (c: RecordedPromptCall) => c.body.parts[0]?.text ?? ""
+		const parentCalls = state.promptAsyncCalls.filter((c) => c.sessionID === "ses_parent")
+
+		// The last completion's terminal notification stays silent.
+		const secondTerminal = parentCalls.find((c) =>
+			wakeText(c).includes(`<task-id>${second.id}</task-id>`),
+		)
+		expect(secondTerminal?.body.noReply).toBe(true)
+		expect(secondTerminal?.body.parts[0]?.text).not.toContain("<remaining>")
+
+		// Exactly two wakes total: first terminal (remaining>0) + all-complete.
+		const wakes = parentCalls.filter((c) => c.body.noReply === false)
+		expect(wakes.length).toBe(2)
+		expect(wakes.filter((c) => wakeText(c).includes("all-complete")).length).toBe(1)
+		expect(
+			wakes.filter((c) => wakeText(c).includes(`<task-id>${first.id}</task-id>`)).length,
+		).toBe(1)
+	})
+
 	test("a turn error on the resolved prompt finalizes as error, not silent complete", async () => {
 		// Regression: a server-side turn failure (e.g. a bad model override →
 		// ProviderModelNotFoundError) RESOLVES session.prompt() with the error on
