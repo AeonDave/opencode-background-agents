@@ -22,6 +22,7 @@ function makeRecord(overrides: Partial<DelegationRecord> = {}): DelegationRecord
 		updatedAt: now,
 		timeoutAt: new Date(now.getTime() + 900_000),
 		maxRunTimeMs: 900_000,
+		model: "anthropic/claude-haiku-4-5",
 		progress: {
 			toolCalls: 3,
 			lastUpdateAt: now,
@@ -48,6 +49,7 @@ describe("state round-trip", () => {
 		expect(revived?.parentSessionID).toBe(record.parentSessionID)
 		expect(revived?.status).toBe(record.status)
 		expect(revived?.maxRunTimeMs).toBe(record.maxRunTimeMs)
+		expect(revived?.model).toBe("anthropic/claude-haiku-4-5")
 		expect(revived?.timeoutAt?.getTime()).toBe(record.timeoutAt?.getTime())
 		expect(revived?.createdAt.getTime()).toBe(record.createdAt.getTime())
 		expect(revived?.progress.toolCalls).toBe(3)

@@ -26,6 +26,7 @@ interface RecordedPromptCall {
 	body: {
 		noReply?: boolean
 		agent?: string
+		model?: { providerID: string; modelID: string }
 		parts: RecordedPart[]
 		tools?: Record<string, boolean>
 	}
@@ -198,6 +199,32 @@ describe("async delegation", () => {
 		expect(promptCall?.body.tools?.delegate).toBe(false)
 		expect(promptCall?.body.tools?.delegation_steer).toBe(false)
 		expect(promptCall?.body.agent).toBe("researcher")
+	})
+
+	test("model override is passed to the child prompt and recorded on the delegation", async () => {
+		const { manager, state } = await setup()
+		const record = await manager.delegate(
+			delegateInput({ model: { providerID: "anthropic", modelID: "claude-haiku-4-5" } }),
+		)
+
+		expect(record.model).toBe("anthropic/claude-haiku-4-5")
+		const promptCall = state.promptCalls.find((c) => c.sessionID === record.sessionID)
+		expect(promptCall?.body.model).toEqual({
+			providerID: "anthropic",
+			modelID: "claude-haiku-4-5",
+		})
+
+		const report = await manager.getStatusReport("ses_parent")
+		expect(report).toContain("model=anthropic/claude-haiku-4-5")
+	})
+
+	test("without a model override the child prompt carries none (agent default applies)", async () => {
+		const { manager, state } = await setup()
+		const record = await manager.delegate(delegateInput())
+
+		expect(record.model).toBeUndefined()
+		const promptCall = state.promptCalls.find((c) => c.sessionID === record.sessionID)
+		expect(promptCall?.body.model).toBeUndefined()
 	})
 
 	test("unknown agent is rejected before any session is created", async () => {

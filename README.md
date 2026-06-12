@@ -26,6 +26,7 @@ Context windows fill up. When compaction kicks in, past research vanishes and th
 - **Keeping you unblocked.** Delegate a task and continue the conversation immediately; no waiting for a sub-agent to finish.
 - **Surviving compaction.** Results are written to disk as markdown. After compaction, the AI retrieves them by ID rather than re-running the task.
 - **Giving mid-run control.** Check status, inject instructions, or abort a delegation while it runs — not just fire-and-forget.
+- **Sizing resources per task.** Timeout and model are set at delegation time: a short window and a cheap model for quick lookups; a long window and a strong model for deep research or builds.
 - **Allowing write-capable agents.** Write- and bash-capable sub-agents can run in the background too, not only read-only ones (toggleable via env var).
 
 ## How it works
@@ -44,7 +45,7 @@ Each delegation runs in its own isolated OpenCode session and is auto-tagged wit
 
 | Tool | Purpose |
 |------|---------|
-| `delegate(prompt, agent, timeout_minutes?)` | Launch a background task; returns a readable ID immediately. The supervisor can size the timeout per task. |
+| `delegate(prompt, agent, timeout_minutes?, model?)` | Launch a background task; returns a readable ID immediately. The supervisor can size the timeout and pick the model per task. |
 | `delegation_read(id)` | Retrieve the full persisted result of a delegation. |
 | `delegation_list()` | List all delegations with titles, summaries, and read state. |
 | `delegation_status()` | Live status of active delegations (elapsed, tool calls, heartbeat, steer count) — instant, never polls. |
@@ -126,6 +127,7 @@ Each delegation gets its own timeout window (default 15 minutes). The supervisor
 ## Best practices
 
 - **Size timeouts per task.** Use a short window for quick lookups and a long one for builds or deep research. Use `0` when you genuinely want the agent to run until done — you can always stop it.
+- **Size the model per task.** `delegate(..., model: "provider/model-id")` overrides the agent's configured model for that one delegation: a cheap, fast model for simple lookups, a strong one for deep work. Omitted, the agent's default applies. An invalid model fails the delegation with an error notification.
 - **Do not poll.** `delegation_status()` is instant and cheap. `<task-notification>` will arrive automatically on completion.
 - **Peek before steering.** Read the live transcript with `delegation_peek` to understand what the agent is doing before sending a correction. Steering without evidence often misdirects rather than corrects.
 - **Read results via `delegation_read`.** Do not try to reconstruct output from status or peek; the full persisted markdown is always available once the delegation reaches a terminal state.
@@ -177,6 +179,9 @@ The opposite — heavy work runs in a separate session, and only the distilled r
 
 **Can write-capable agents run in the background?**
 Yes, by default. Their changes live outside OpenCode's undo/branching tree and cannot be reverted via the UI. Set `BACKGROUND_AGENTS_STRICT_READONLY=1` to forbid this.
+
+**Can I use a different model for a specific delegation?**
+Yes. Pass `model: "provider/model-id"` as the fourth argument to `delegate` (e.g. `anthropic/claude-haiku-4-5`). The override applies only to that delegation; other delegations keep their agent's configured model. An invalid format is rejected immediately by the tool; a nonexistent model fails the delegation with an error notification. The active model shows up in `delegation_status()` and `delegation_peek`.
 
 ## Credits
 

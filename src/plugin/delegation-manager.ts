@@ -605,7 +605,7 @@ class DelegationManager {
 		const deadline = delegation.timeoutAt
 			? `timeout in ${Math.max(Math.round((delegation.timeoutAt.getTime() - now) / 1000), 0)}s`
 			: "no timeout"
-		const header = `## Peek: ${delegation.id} [${delegation.status}] agent=${delegation.agent}\nelapsed=${elapsed}s · ${deadline} · tools=${delegation.progress.toolCalls} · steers=${delegation.progress.steerCount ?? 0}`
+		const header = `## Peek: ${delegation.id} [${delegation.status}] agent=${delegation.agent}${delegation.model ? ` model=${delegation.model}` : ""}\nelapsed=${elapsed}s · ${deadline} · tools=${delegation.progress.toolCalls} · steers=${delegation.progress.steerCount ?? 0}`
 		const footer = `Act on it: delegation_steer("${delegation.id}", …) · delegation_stop("${delegation.id}") · or wait for the <task-notification>. Do not poll peek in a loop.`
 
 		return `${header}\n\n${digest}\n\n${footer}`
@@ -633,7 +633,7 @@ class DelegationManager {
 				? `timeout in ${Math.max(Math.round((d.timeoutAt.getTime() - now) / 1000), 0)}s`
 				: "no timeout"
 			const parts = [
-				`- **${d.id}** [${d.status}] agent=${d.agent}`,
+				`- **${d.id}** [${d.status}] agent=${d.agent}${d.model ? ` model=${d.model}` : ""}`,
 				`  elapsed=${elapsed}s · ${deadline} · tools=${d.progress.toolCalls} · heartbeat=${age(d.progress.lastHeartbeatAt)}`,
 			]
 			if (d.progress.steerCount) {
@@ -669,6 +669,7 @@ class DelegationManager {
 		agent: string
 		artifactPath: string
 		maxRunTimeMs?: number
+		model?: string
 	}): DelegationRecord {
 		if (!this.pendingByParent.has(input.parentSessionID)) {
 			this.pendingByParent.set(input.parentSessionID, new Set())
@@ -699,6 +700,7 @@ class DelegationManager {
 				? undefined
 				: new Date(now.getTime() + maxRunTimeMs),
 			maxRunTimeMs,
+			model: input.model,
 			progress: {
 				toolCalls: 0,
 				lastUpdateAt: now,
@@ -1332,6 +1334,7 @@ class DelegationManager {
 			agent: input.agent,
 			artifactPath,
 			maxRunTimeMs: input.maxRunTimeMs,
+			model: input.model ? `${input.model.providerID}/${input.model.modelID}` : undefined,
 		})
 
 		await this.debugLog(`Registered delegation ${delegation.id} before execution`)
@@ -1348,6 +1351,8 @@ class DelegationManager {
 				path: { id: delegation.sessionID },
 				body: {
 					agent: input.agent,
+					// Supervisor-chosen model override; omitted = the agent's configured model.
+					...(input.model ? { model: input.model } : {}),
 					parts: [{ type: "text", text: input.prompt }],
 					tools: {
 						task: false,

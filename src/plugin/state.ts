@@ -95,6 +95,7 @@ function deserializeDelegation(json: string): DelegationRecord | undefined {
 			? undefined
 			: (reviveDate(raw.timeoutAt) ?? new Date(now.getTime() + maxRunTimeMs)),
 		maxRunTimeMs,
+		model: asString(raw.model),
 		progress: {
 			toolCalls: typeof progress.toolCalls === "number" ? progress.toolCalls : 0,
 			lastUpdateAt: reviveDate(progress.lastUpdateAt) ?? now,

@@ -9,7 +9,7 @@ const COMMON_HEADER = `<task-notification>
 ## Async Delegation
 
 You have tools for parallel background work:
-- \`delegate(prompt, agent, timeout_minutes?)\` - Launch task, returns ID immediately. Size \`timeout_minutes\` to the task (default 15, **0 = no timeout** — you stay in control via steer/stop); a delivered steer re-opens a fresh window.
+- \`delegate(prompt, agent, timeout_minutes?, model?)\` - Launch task, returns ID immediately. Size \`timeout_minutes\` to the task (default 15, **0 = no timeout** — you stay in control via steer/stop); a delivered steer re-opens a fresh window. Optionally pick the \`model\` ("provider/model-id") per task: cheap/fast for simple lookups, strong for deep work; omitted = the agent's default.
 - \`delegation_read(id)\` - Retrieve completed result
 - \`delegation_list()\` - List delegations (use sparingly)
 

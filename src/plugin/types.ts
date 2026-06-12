@@ -78,6 +78,8 @@ interface DelegationRecord {
 	timeoutAt?: Date
 	/** Effective max runtime; a delivered steer re-opens a window of this size. 0 = unlimited. */
 	maxRunTimeMs: number
+	/** Supervisor-chosen model override as "provider/model-id"; absent = agent's default. */
+	model?: string
 	progress: DelegationProgress
 	notification: DelegationNotificationState
 	retrieval: DelegationRetrievalState
@@ -136,6 +138,24 @@ const STALL_CHECK_MS = 20_000
 // that rejects write-capable agents and forces them onto the native `task` tool.
 const STRICT_READONLY = process.env.BACKGROUND_AGENTS_STRICT_READONLY === "1"
 
+/** Model reference as the prompt API expects it. */
+interface ModelRef {
+	providerID: string
+	modelID: string
+}
+
+/**
+ * Parse a supervisor-supplied "provider/model-id" string. The model ID may itself
+ * contain slashes (e.g. openrouter paths), so only the FIRST segment is the provider.
+ * Returns undefined for strings that cannot address a model.
+ */
+function parseModelString(value: string): ModelRef | undefined {
+	const [providerID, ...modelSegments] = value.trim().split("/")
+	const modelID = modelSegments.join("/")
+	if (!providerID || !modelID) return undefined
+	return { providerID, modelID }
+}
+
 interface DelegateInput {
 	parentSessionID: string
 	parentMessageID: string
@@ -144,6 +164,8 @@ interface DelegateInput {
 	agent: string
 	/** Supervisor-chosen max runtime; 0 = unlimited. Falls back to the configured default. */
 	maxRunTimeMs?: number
+	/** Supervisor-chosen model override; omitted = the agent's configured model. */
+	model?: ModelRef
 }
 
 interface DelegationListItem {
@@ -214,6 +236,7 @@ export type {
 	DelegateInput,
 	DelegationListItem,
 	DelegationManagerOptions,
+	ModelRef,
 	NativeSteerFn,
 }
 export {
@@ -232,5 +255,6 @@ export {
 	isTerminalStatus,
 	isActiveStatus,
 	normalizeId,
+	parseModelString,
 	parsePersistedStatus,
 }

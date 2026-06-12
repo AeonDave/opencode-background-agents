@@ -1,12 +1,13 @@
 import { tool } from "@opencode-ai/plugin"
 import type { ToolContext } from "@opencode-ai/plugin"
 import type { DelegationManager } from "./delegation-manager"
-import { DEFAULT_MAX_RUN_TIME_MS, isUnlimitedRunTime } from "./types"
+import { DEFAULT_MAX_RUN_TIME_MS, isUnlimitedRunTime, parseModelString } from "./types"
 
 interface DelegateArgs {
 	prompt: string
 	agent: string
 	timeout_minutes?: number
+	model?: string
 }
 
 function createDelegate(manager: DelegationManager): ReturnType<typeof tool> {
@@ -39,6 +40,12 @@ Use \`delegation_read\` with the ID to retrieve full persisted output (including
 						DEFAULT_MAX_RUN_TIME_MS / 60_000,
 					)}). Use 0 for NO timeout — you stay in control via delegation_steer/delegation_stop. Size it to the task: short for quick lookups, long (or 0) for deep research/builds. A delivered steer re-opens a fresh window of the same size.`,
 				),
+			model: tool.schema
+				.string()
+				.optional()
+				.describe(
+					'Optional model override for THIS delegation as "provider/model-id" (e.g. "anthropic/claude-haiku-4-5"). Size the brain to the task: a cheap/fast model for simple lookups, a strong one for deep work. Omitted = the agent\'s configured model.',
+				),
 		},
 		async execute(args: DelegateArgs, toolCtx: ToolContext): Promise<string> {
 			if (!toolCtx?.sessionID) {
@@ -46,6 +53,14 @@ Use \`delegation_read\` with the ID to retrieve full persisted output (including
 			}
 			if (!toolCtx?.messageID) {
 				return "❌ delegate requires messageID. This is a system error."
+			}
+
+			let model: ReturnType<typeof parseModelString>
+			if (args.model !== undefined) {
+				model = parseModelString(args.model)
+				if (!model) {
+					return `❌ Invalid model "${args.model}". Expected "provider/model-id" (e.g. "anthropic/claude-haiku-4-5"), or omit it to use the agent's configured model.`
+				}
 			}
 
 			try {
@@ -58,6 +73,7 @@ Use \`delegation_read\` with the ID to retrieve full persisted output (including
 					// 0 is meaningful (no timeout): only an omitted argument falls back to the default.
 					maxRunTimeMs:
 						args.timeout_minutes !== undefined ? args.timeout_minutes * 60_000 : undefined,
+					model,
 				})
 
 				// Get total active count for this parent session
@@ -67,7 +83,7 @@ Use \`delegation_read\` with the ID to retrieve full persisted output (including
 				const timeoutLabel = isUnlimitedRunTime(delegation.maxRunTimeMs)
 					? "none (steer/stop it whenever needed)"
 					: `${Math.round(delegation.maxRunTimeMs / 60_000)}min (a steer resets the window)`
-				let response = `Delegation started: ${delegation.id}\nAgent: ${args.agent}\nTimeout: ${timeoutLabel}`
+				let response = `Delegation started: ${delegation.id}\nAgent: ${args.agent}${delegation.model ? `\nModel: ${delegation.model}` : ""}\nTimeout: ${timeoutLabel}`
 				if (totalActive > 1) {
 					response += `\n\n${totalActive} delegations now active.`
 				}
