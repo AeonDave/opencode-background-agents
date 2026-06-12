@@ -1368,7 +1368,19 @@ class DelegationManager {
 					},
 				},
 			})
-			.then(() => {
+			.then((result) => {
+				// A turn that fails server-side (e.g. ProviderModelNotFoundError from a bad
+				// `model` override, provider-auth, or context-overflow) still RESOLVES here:
+				// the failure rides on the returned assistant message's `error` field, and that
+				// errored message is NOT persisted to the transcript. getResult() would then see
+				// only the user prompt and mislabel the run "complete" with no output. Detecting
+				// it here lets us finalize as `error` immediately, before the session.idle debounce
+				// (which also fires for the failed turn) settles it as a silent "complete".
+				const turnError = this.extractTurnError(result)
+				if (turnError) {
+					void this.finalizeDelegation(delegation.id, "error", turnError)
+					return
+				}
 				this.scheduleComplete(delegation.id)
 			})
 			.catch((error: Error) => {
@@ -1376,6 +1388,25 @@ class DelegationManager {
 			})
 
 		return delegation
+	}
+
+	/**
+	 * Extract a turn-level failure from a `session.prompt` result. Server-side turn errors
+	 * resolve the prompt promise (rather than rejecting it) with the failure on
+	 * `data.info.error` as `{ name, data: { message? } }`. Typed structurally so the plugin
+	 * stays decoupled from the SDK version the host bundles. Returns a one-line
+	 * "Name: message" string, or undefined when the turn carried no error.
+	 */
+	private extractTurnError(result: unknown): string | undefined {
+		const error = (
+			result as {
+				data?: { info?: { error?: { name?: string; data?: { message?: string } } } }
+			}
+		)?.data?.info?.error
+		if (!error) return undefined
+		const name = error.name ?? "TurnError"
+		const message = error.data?.message?.trim()
+		return message ? `${name}: ${message}` : name
 	}
 
 	/**

@@ -299,6 +299,40 @@ describe("completion and notifications", () => {
 		)
 	})
 
+	test("a turn error on the resolved prompt finalizes as error, not silent complete", async () => {
+		// Regression: a server-side turn failure (e.g. a bad model override →
+		// ProviderModelNotFoundError) RESOLVES session.prompt() with the error on
+		// data.info.error, and the errored assistant message is never persisted. The run
+		// must surface as `error`, not the misleading "complete with no output".
+		const { manager, state } = await setup()
+		const record = await manager.delegate(delegateInput())
+
+		// No assistant message in the transcript — exactly what the live failure produced.
+		state.messagesBySession.set(record.sessionID, [{ info: { role: "user" }, parts: [] }])
+		state.promptResolvers.get(record.sessionID)?.resolve({
+			data: {
+				info: {
+					role: "assistant",
+					error: {
+						name: "ProviderModelNotFoundError",
+						data: { message: "model anthropic/claude-sonnet-4-5 not found" },
+					},
+				},
+				parts: [],
+			},
+		})
+
+		await waitFor(() => record.status === "error")
+		expect(record.error).toContain("ProviderModelNotFoundError")
+		expect(record.error).toContain("claude-sonnet-4-5")
+
+		const artifact = await fs.readFile(record.artifact.filePath, "utf8")
+		expect(artifact).toContain("ProviderModelNotFoundError")
+		await waitFor(() =>
+			state.promptAsyncCalls.some((c) => c.body.parts[0]?.text?.includes("<status>error</status>")),
+		)
+	})
+
 	test("undeliverable parent notification is queued and injected into the next chat message", async () => {
 		const { manager, state } = await setup()
 		const record = await manager.delegate(delegateInput())
