@@ -299,6 +299,42 @@ describe("completion and notifications", () => {
 		)
 	})
 
+	test("a completion with siblings still running WAKES the supervisor (noReply=false)", async () => {
+		// Regression: an idle supervisor must be woken as soon as ANY delegation completes
+		// while others are still running, so it can act on the result and steer/await the
+		// rest. Previously every terminal notification used noReply=true, leaving the
+		// supervisor dormant until the WHOLE batch settled.
+		const { manager, state } = await setup()
+		const first = await manager.delegate(delegateInput())
+		const second = await manager.delegate(delegateInput())
+
+		// Only the FIRST finishes; the SECOND keeps running (remaining = 1).
+		state.promptResolvers.get(first.sessionID)?.resolve({})
+		await waitFor(() => first.status === "complete")
+		expect(second.status).toBe("running")
+
+		await waitFor(() =>
+			state.promptAsyncCalls.some(
+				(c) =>
+					c.sessionID === "ses_parent" &&
+					c.body.parts[0]?.text?.includes(`<task-id>${first.id}</task-id>`),
+			),
+		)
+		const terminal = state.promptAsyncCalls.find(
+			(c) =>
+				c.sessionID === "ses_parent" &&
+				c.body.parts[0]?.text?.includes(`<task-id>${first.id}</task-id>`),
+		)
+		// remaining > 0 → must wake the supervisor.
+		expect(terminal?.body.noReply).toBe(false)
+		expect(terminal?.body.parts[0]?.text).toContain("<remaining>1</remaining>")
+
+		// The batch is not complete yet, so no all-complete wake has fired.
+		expect(
+			state.promptAsyncCalls.some((c) => c.body.parts[0]?.text?.includes("all-complete")),
+		).toBe(false)
+	})
+
 	test("a turn error on the resolved prompt finalizes as error, not silent complete", async () => {
 		// Regression: a server-side turn failure (e.g. a bad model override →
 		// ProviderModelNotFoundError) RESOLVES session.prompt() with the error on

@@ -1226,11 +1226,18 @@ class DelegationManager {
 			const remainingCount = this.getPendingCount(delegation.parentSessionID)
 			const terminalNotification = this.buildTerminalNotification(delegation, remainingCount)
 
+			// Wake semantics: a completion that still has siblings running (remaining > 0) must
+			// WAKE the supervisor (noReply=false) so it can act on this result and steer/await
+			// the rest — otherwise an idle supervisor stays dormant until the WHOLE batch
+			// settles, even when an actionable result is already in. When this is the last one
+			// (remaining === 0) we stay silent here and let the all-complete notification (also
+			// noReply=false, scheduled just below) deliver the single wake, avoiding a double-wake.
+			const noReply = remainingCount === 0
 			const deliveryStatus = await this.sendParentNotification(
 				delegation.parentSessionID,
 				delegation.parentAgent,
 				terminalNotification,
-				true,
+				noReply,
 			)
 
 			this.markNotified(delegation.id)
