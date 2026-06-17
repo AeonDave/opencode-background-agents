@@ -15,6 +15,7 @@ import {
 	isTerminalStatus,
 	isUnlimitedRunTime,
 	normalizeId,
+	KEEP_CHILD_SESSIONS,
 	PARENT_NOTIFICATION_TIMEOUT_MS,
 	parsePersistedStatus,
 	READ_POLL_INTERVAL_MS,
@@ -47,6 +48,9 @@ class DelegationManager {
 	// Unique tool callIDs seen per delegation: part events fire repeatedly for the same
 	// call (pending → running → completed), so the Set dedupes the toolCalls counter.
 	private toolCallsSeen: Map<string, Set<string>> = new Map()
+	// Child session IDs whose server-side session has already been deleted by cleanup, so we
+	// never issue a second delete for the same delegation.
+	private cleanedChildSessions: Set<string> = new Set()
 	private watchdogTimer?: ReturnType<typeof setInterval>
 	private client: OpencodeClient
 	private baseDir: string
@@ -500,6 +504,7 @@ class DelegationManager {
 		if (!(await this.confirmSessionStopped(delegation.sessionID))) {
 			try {
 				await this.client.session.delete({ path: { id: delegation.sessionID } })
+				this.cleanedChildSessions.add(delegation.sessionID)
 				await this.debugLog(`stopDelegation: force-deleted lingering session for ${delegation.id}`)
 			} catch (error) {
 				await this.debugLog(
@@ -1017,11 +1022,40 @@ class DelegationManager {
 	}
 
 	private markRetrieved(id: string, readerSessionID: string): DelegationRecord | undefined {
-		return this.updateDelegation(id, (delegation, now) => {
+		const record = this.updateDelegation(id, (delegation, now) => {
 			delegation.retrieval.retrievedAt = now
 			delegation.retrieval.retrievalCount += 1
 			delegation.retrieval.lastReaderSessionID = readerSessionID
 		})
+		// The supervisor has now consumed this delegation's result; its child session is no
+		// longer needed for navigation and only clutters the TUI's child-session cycle.
+		this.maybeCleanupChildSession(id)
+		return record
+	}
+
+	/**
+	 * Delete a finished, already-read delegation's child session so it stops appearing in the
+	 * TUI's child-session navigation (ctrl+x ↓ / ←/→). Only fires when the delegation is
+	 * terminal AND has been retrieved; the persisted artifact remains the durable record, so
+	 * delegation_read keeps working afterwards. No-op when cleanup is disabled
+	 * (BACKGROUND_AGENTS_KEEP_CHILD_SESSIONS=1) or the session was already deleted.
+	 */
+	private maybeCleanupChildSession(id: string): void {
+		if (KEEP_CHILD_SESSIONS) return
+		const delegation = this.delegations.get(id)
+		if (!delegation) return
+		if (!isTerminalStatus(delegation.status)) return
+		if (!delegation.retrieval.retrievedAt) return
+		if (this.cleanedChildSessions.has(delegation.sessionID)) return
+		this.cleanedChildSessions.add(delegation.sessionID)
+		void this.client.session
+			.delete({ path: { id: delegation.sessionID } })
+			.then(() => this.debugLog(`Cleaned up child session for read delegation ${delegation.id}`))
+			.catch((error: Error) =>
+				this.debugLog(
+					`maybeCleanupChildSession: delete failed for ${delegation.id}: ${error.message}`,
+				),
+			)
 	}
 
 	private hasUnreadCompletion(delegation: DelegationRecord): boolean {
@@ -1316,10 +1350,13 @@ class DelegationManager {
 
 		await this.debugLog(`delegate() called, generated stable ID: ${stableId}`)
 
-		// Create isolated session for delegation
+		// Create isolated session for delegation. The title doubles as the child session's
+		// label in the TUI session list and child-session navigation (ctrl+x ↓ / ←/→), so it
+		// leads with the agent name and delegation id to make each running subagent
+		// identifiable at a glance instead of a generic "Delegation: <id>".
 		const sessionResult = await this.client.session.create({
 			body: {
-				title: `Delegation: ${stableId}`,
+				title: `${input.agent} · ${stableId}`,
 				parentID: input.parentSessionID,
 			},
 		})
@@ -1348,6 +1385,16 @@ class DelegationManager {
 		this.scheduleTimeout(delegation.id)
 		this.markStarted(delegation.id)
 		this.persistState(delegation.id)
+
+		// Human-facing dispatch signal. After delegate() returns the supervisor turn ends, so
+		// the TUI shows it idle while the child runs in the background — without this toast the
+		// dispatch looks like nothing happened. Completion is announced by a second toast.
+		void this.showToast(
+			`Delegation started: ${delegation.id} → ${input.agent}${
+				delegation.model ? ` (${delegation.model})` : ""
+			}`,
+			"info",
+		)
 
 		// Fire the prompt (using prompt() instead of promptAsync() to properly initialize agent loop)
 		// Agent param is critical for MCP tools - tells OpenCode which agent's config to use
@@ -1430,6 +1477,7 @@ class DelegationManager {
 			await this.client.session.delete({
 				path: { id: delegation.sessionID },
 			})
+			this.cleanedChildSessions.add(delegation.sessionID)
 		} catch {
 			// Ignore
 		}
@@ -1727,6 +1775,7 @@ ${description}
 					await this.client.session.delete({
 						path: { id: delegation.sessionID },
 					})
+					this.cleanedChildSessions.add(delegation.sessionID)
 				} catch {
 					// Session may already be deleted
 				}

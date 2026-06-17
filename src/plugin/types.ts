@@ -138,6 +138,17 @@ const STALL_CHECK_MS = 20_000
 // that rejects write-capable agents and forces them onto the native `task` tool.
 const STRICT_READONLY = process.env.BACKGROUND_AGENTS_STRICT_READONLY === "1"
 
+// Child-session cleanup. A delegation runs in its own child session (created with
+// parentID = the supervisor session), which the OpenCode TUI exposes via child-session
+// navigation (ctrl+x ↓, then ←/→). Finished sessions are never evicted by the server, so
+// over a long supervisor session they pile up and that navigation cycles through dozens of
+// stale, completed delegations. By default, once a delegation is BOTH terminal AND its
+// result has been read by the supervisor, the plugin deletes the underlying child session
+// so navigation only cycles through live and not-yet-read delegations. The persisted
+// artifact (.md) is the durable record, so delegation_read still works after deletion. Set
+// BACKGROUND_AGENTS_KEEP_CHILD_SESSIONS=1 to keep every finished child session instead.
+const KEEP_CHILD_SESSIONS = process.env.BACKGROUND_AGENTS_KEEP_CHILD_SESSIONS === "1"
+
 /** Model reference as the prompt API expects it. */
 interface ModelRef {
 	providerID: string
@@ -252,6 +263,7 @@ export {
 	WATCHDOG_INTERVAL_MS,
 	STALL_CHECK_MS,
 	STRICT_READONLY,
+	KEEP_CHILD_SESSIONS,
 	isTerminalStatus,
 	isActiveStatus,
 	normalizeId,

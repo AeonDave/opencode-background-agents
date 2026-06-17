@@ -201,6 +201,18 @@ describe("async delegation", () => {
 		expect(promptCall?.body.agent).toBe("researcher")
 	})
 
+	test("dispatch surfaces a clean 'started' toast (the on-screen cue a subagent launched)", async () => {
+		const { manager, state } = await setup()
+		const record = await manager.delegate(delegateInput({ agent: "researcher" }))
+
+		await waitFor(() => state.toasts.some((t) => t.message?.startsWith("Delegation started")))
+		const started = state.toasts.find((t) => t.message?.startsWith("Delegation started"))
+		expect(started?.message).toContain(record.id)
+		expect(started?.message).toContain("researcher")
+		// Kept clean: the navigation hint lives in the supervisor's announcement, not the toast.
+		expect(started?.message?.toLowerCase()).not.toContain("ctrl")
+	})
+
 	test("model override is passed to the child prompt and recorded on the delegation", async () => {
 		const { manager, state } = await setup()
 		const record = await manager.delegate(
@@ -576,6 +588,39 @@ describe("timeouts", () => {
 		const output = await manager.readOutput("ses_parent", record.id)
 		expect(record.status).toBe("running")
 		expect(output).toContain("still running")
+	})
+})
+
+describe("child session cleanup", () => {
+	test("reading a finished delegation deletes its child session exactly once", async () => {
+		const { manager, state } = await setup()
+		const record = await manager.delegate(delegateInput())
+
+		state.promptResolvers.get(record.sessionID)?.resolve({})
+		await waitFor(() => record.status === "complete")
+
+		// Finishing alone must NOT delete the child session: it stays navigable until read.
+		expect(state.deletedSessions).not.toContain(record.sessionID)
+
+		const output = await manager.readOutput("ses_parent", record.id)
+		expect(output).toContain("FINAL RESULT")
+		await waitFor(() => state.deletedSessions.includes(record.sessionID))
+
+		// Re-reading is served from the persisted artifact and never double-deletes.
+		const again = await manager.readOutput("ses_parent", record.id)
+		expect(again).toContain("FINAL RESULT")
+		expect(state.deletedSessions.filter((id) => id === record.sessionID).length).toBe(1)
+	})
+
+	test("a running delegation's session is never cleaned up by a (deferred) read", async () => {
+		const { manager, state } = await setup()
+		const record = await manager.delegate(delegateInput({ maxRunTimeMs: 0 }))
+
+		// Unlimited delegation: read returns "still running" without forcing terminal state.
+		const output = await manager.readOutput("ses_parent", record.id)
+		expect(output).toContain("still running")
+		expect(record.status).toBe("running")
+		expect(state.deletedSessions).not.toContain(record.sessionID)
 	})
 })
 

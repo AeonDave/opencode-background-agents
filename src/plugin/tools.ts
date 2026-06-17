@@ -1,5 +1,5 @@
 import { tool } from "@opencode-ai/plugin"
-import type { ToolContext } from "@opencode-ai/plugin"
+import type { ToolContext, ToolResult } from "@opencode-ai/plugin"
 import type { DelegationManager } from "./delegation-manager"
 import { DEFAULT_MAX_RUN_TIME_MS, isUnlimitedRunTime, parseModelString } from "./types"
 
@@ -47,7 +47,7 @@ Use \`delegation_read\` with the ID to retrieve full persisted output (including
 					'Optional model override for THIS delegation as "provider/model-id" (e.g. "anthropic/claude-haiku-4-5"). Size the brain to the task: a cheap/fast model for simple lookups, a strong one for deep work. Omitted = the agent\'s configured model.',
 				),
 		},
-		async execute(args: DelegateArgs, toolCtx: ToolContext): Promise<string> {
+		async execute(args: DelegateArgs, toolCtx: ToolContext): Promise<ToolResult> {
 			if (!toolCtx?.sessionID) {
 				return "❌ delegate requires sessionID. This is a system error."
 			}
@@ -76,6 +76,13 @@ Use \`delegation_read\` with the ID to retrieve full persisted output (including
 					model,
 				})
 
+				// Compact one-line tool-call header for the TUI. A plugin tool's title is taken
+				// from the RETURNED object only (registry.ts:150 — a bare string yields an empty
+				// title, and the TUI then falls back to dumping every argument inline, including
+				// the full prompt). So we compute the title here and return { title, output }.
+				const modelShort = delegation.model?.split("/").pop()
+				const toolTitle = `${args.agent}${modelShort ? ` · ${modelShort}` : ""} · ${delegation.id}`
+
 				// Get total active count for this parent session
 				const pendingSet = manager.getPendingCount(toolCtx.sessionID)
 				const totalActive = pendingSet
@@ -89,7 +96,7 @@ Use \`delegation_read\` with the ID to retrieve full persisted output (including
 				}
 				response += `\nYou WILL be notified when ${totalActive > 1 ? "ALL complete" : "complete"}. Do NOT poll.`
 
-				return response
+				return { title: toolTitle, output: response }
 			} catch (error) {
 				// Return validation errors as guidance, not exceptions
 				return `❌ Delegation failed:\n\n${error instanceof Error ? error.message : "Unknown error"}`
@@ -105,12 +112,12 @@ Use this to retrieve results from delegated tasks if the inline notification was
 		args: {
 			id: tool.schema.string().describe("The delegation ID (e.g., 'elegant-blue-tiger')"),
 		},
-		async execute(args: { id: string }, toolCtx: ToolContext): Promise<string> {
+		async execute(args: { id: string }, toolCtx: ToolContext): Promise<ToolResult> {
 			if (!toolCtx?.sessionID) {
 				return "❌ delegation_read requires sessionID. This is a system error."
 			}
 
-			return await manager.readOutput(toolCtx.sessionID, args.id)
+			return { title: args.id, output: await manager.readOutput(toolCtx.sessionID, args.id) }
 		},
 	})
 }
@@ -154,11 +161,14 @@ Only works while the delegation is active (registered/running); finished tasks r
 				.string()
 				.describe("The additional instruction to inject into the running agent. Must be in English."),
 		},
-		async execute(args: { id: string; message: string }, toolCtx: ToolContext): Promise<string> {
+		async execute(args: { id: string; message: string }, toolCtx: ToolContext): Promise<ToolResult> {
 			if (!toolCtx?.sessionID) {
 				return "❌ delegation_steer requires sessionID. This is a system error."
 			}
-			return await manager.steerDelegation(toolCtx.sessionID, args.id, args.message)
+			return {
+				title: args.id,
+				output: await manager.steerDelegation(toolCtx.sessionID, args.id, args.message),
+			}
 		},
 	})
 }
@@ -173,11 +183,11 @@ decision — do NOT call it in a polling loop; completion still arrives via <tas
 		args: {
 			id: tool.schema.string().describe("The delegation ID to peek at (e.g., 'elegant-blue-tiger')."),
 		},
-		async execute(args: { id: string }, toolCtx: ToolContext): Promise<string> {
+		async execute(args: { id: string }, toolCtx: ToolContext): Promise<ToolResult> {
 			if (!toolCtx?.sessionID) {
 				return "❌ delegation_peek requires sessionID. This is a system error."
 			}
-			return await manager.peekDelegation(toolCtx.sessionID, args.id)
+			return { title: args.id, output: await manager.peekDelegation(toolCtx.sessionID, args.id) }
 		},
 	})
 }
@@ -190,11 +200,11 @@ partial result afterwards with delegation_read(id).`,
 		args: {
 			id: tool.schema.string().describe("The delegation ID to stop."),
 		},
-		async execute(args: { id: string }, toolCtx: ToolContext): Promise<string> {
+		async execute(args: { id: string }, toolCtx: ToolContext): Promise<ToolResult> {
 			if (!toolCtx?.sessionID) {
 				return "❌ delegation_stop requires sessionID. This is a system error."
 			}
-			return await manager.stopDelegation(toolCtx.sessionID, args.id)
+			return { title: args.id, output: await manager.stopDelegation(toolCtx.sessionID, args.id) }
 		},
 	})
 }
