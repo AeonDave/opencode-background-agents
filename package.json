@@ -1,6 +1,6 @@
 {
   "name": "@aeondave/opencode-background-agents",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Async, supervised background agent delegation for OpenCode - delegate, steer, stop, and persist sub-agent work.",
   "keywords": [
     "opencode",

@@ -76,10 +76,12 @@ Use \`delegation_read\` with the ID to retrieve full persisted output (including
 					model,
 				})
 
-				// Compact one-line tool-call header for the TUI. A plugin tool's title is taken
-				// from the RETURNED object only (registry.ts:150 — a bare string yields an empty
-				// title, and the TUI then falls back to dumping every argument inline, including
-				// the full prompt). So we compute the title here and return { title, output }.
+				// A plugin tool's `state.title` comes from the RETURNED object, not ctx.metadata
+				// (registry.ts:150). We set a concise one — surfaces that render custom-tool
+				// titles get a clean header instead of the empty default. Note: OpenCode's
+				// generic tool renderer shows the raw args inline regardless of this title; the
+				// human-facing "a subagent launched" cue is the dispatch toast + the child
+				// session title (`<agent> · <id>`), not this field.
 				const modelShort = delegation.model?.split("/").pop()
 				const toolTitle = `${args.agent}${modelShort ? ` · ${modelShort}` : ""} · ${delegation.id}`
 
