@@ -75,7 +75,7 @@ To install this fork with `notify_parent` and bidirectional delegation in OpenCo
 1. **Clone the repository and install dependencies:**
 
    ```bash
-   git clone <FORK_URL>
+   git clone https://github.com/0tomi/opencode-background-agents.git
    cd opencode-background-agents
    git checkout feat/notify-parent
    npm install
