@@ -993,3 +993,73 @@ describe("notify_parent", () => {
 	})
 })
 
+describe("handleUserSteerCommand (/steer direct user command)", () => {
+	test("no running delegations: informs user cleanly", async () => {
+		const { manager, state } = await setup()
+		const res = await manager.handleUserSteerCommand("ses_parent", "/steer do something")
+		expect(res).toContain("❌")
+		expect(res).toContain("No active delegations")
+		expect(state.toasts.some((t) => t.message?.includes("No active delegations"))).toBe(true)
+	})
+
+	test("empty /steer or /steer list: displays active delegations", async () => {
+		const { manager, state } = await setup()
+		const record = await manager.delegate(delegateInput({ agent: "researcher" }))
+
+		const res = await manager.handleUserSteerCommand("ses_parent", "/steer")
+		expect(res).toContain(record.id)
+		expect(res).toContain("researcher")
+		expect(state.toasts.some((t) => t.message?.includes(record.id))).toBe(true)
+	})
+
+	test("single active delegation: auto-detects target without requiring ID", async () => {
+		const { manager, state } = await setup()
+		const record = await manager.delegate(delegateInput({ agent: "researcher" }))
+
+		const res = await manager.handleUserSteerCommand("ses_parent", "/steer focus on auth module")
+		expect(res).toContain("✅")
+		expect(res).toContain(record.id)
+
+		const call = state.promptAsyncCalls.find((c) => c.sessionID === record.sessionID)
+		expect(call?.body.parts[0]?.text).toBe("[SUPERVISOR STEER] focus on auth module")
+	})
+
+	test("resolves target by agent name", async () => {
+		const { manager, state } = await setup()
+		const rec = await manager.delegate(delegateInput({ agent: "researcher" }))
+
+		const res = await manager.handleUserSteerCommand("ses_parent", "/steer researcher check tests")
+		expect(res).toContain("✅")
+		expect(res).toContain(rec.id)
+
+		const call = state.promptAsyncCalls.find((c) => c.sessionID === rec.sessionID)
+		expect(call?.body.parts[0]?.text).toBe("[SUPERVISOR STEER] check tests")
+	})
+
+	test("resolves target by partial ID substring", async () => {
+		const { manager, state } = await setup()
+		const rec = await manager.delegate(delegateInput({ agent: "researcher" }))
+		// rec.id is task-1
+		const res = await manager.handleUserSteerCommand("ses_parent", "/steer task-1 check edge cases")
+		expect(res).toContain("✅")
+		expect(res).toContain(rec.id)
+
+		const call = state.promptAsyncCalls.find((c) => c.sessionID === rec.sessionID)
+		expect(call?.body.parts[0]?.text).toBe("[SUPERVISOR STEER] check edge cases")
+	})
+
+	test("multiple active delegations: rejects ambiguous target and lists options", async () => {
+		const { manager, state } = await setup()
+		const rec1 = await manager.delegate(delegateInput({ agent: "researcher" }))
+		const rec2 = await manager.delegate(delegateInput({ agent: "researcher" }))
+
+		const res = await manager.handleUserSteerCommand("ses_parent", "/steer just do it")
+		expect(res).toContain("❌")
+		expect(res).toContain("Could not resolve")
+		expect(res).toContain(rec1.id)
+		expect(res).toContain(rec2.id)
+		expect(state.toasts.some((t) => t.message?.includes("Specify target subagent"))).toBe(true)
+	})
+})
+
+

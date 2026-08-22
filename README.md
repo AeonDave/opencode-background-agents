@@ -64,6 +64,19 @@ Each delegation runs in its own isolated OpenCode session and is auto-tagged wit
 - **Stop** aborts the session cleanly. Partial output is saved and readable via `delegation_read(id)`, marked `[STOPPED BY SUPERVISOR]`.
 - **Notify Parent** (`notify_parent`) enables child-to-parent communication. A delegated sub-agent can spontaneously alert its immediate parent supervisor when encountering a blocker, ambiguity, or material decision. It does NOT terminate or change the delegation's running status. The parent receives a synthetic `<child-notification>` part containing the child's delegation ID and agent name, and can reply back using `delegation_steer(id, message)`. In nested hierarchies ($A \to B \to C$), calling `notify_parent` in $C$ reaches direct parent $B$, never skipping to root $A$. If the parent session is busy, the message is queued and injected automatically on the next turn.
 
+### Direct User Steering (`/steer` command)
+
+You can send instructions directly to active sub-agents from the main OpenCode chat prompt bar without having to ask the supervisor agent:
+
+```text
+/steer <message>                 # If 1 subagent is running, auto-detects it
+/steer <agent_name> <message>    # Target by agent name (e.g. /steer researcher Check tests)
+/steer <id_or_keyword> <message> # Target by ID or substring (e.g. /steer tiger Check tests)
+/steer                           # Lists active subagents in a TUI toast
+```
+
+The plugin intercepts this command before it reaches the supervisor LLM, delivers the instruction to the sub-agent session in real-time, and surfaces a confirmation toast without consuming tokens from the supervisor session.
+
 Completion is delivered via `<task-notification>` — there is no need to poll.
 
 Notifications are split by audience: the model receives `<task-notification>` and `<child-notification>` XML as hidden synthetic parts (the TUI does not render them), while the human gets a TUI toast. The chat stays clean and the supervisor still receives full machine-readable context.

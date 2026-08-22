@@ -142,13 +142,48 @@ const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 			output.system.push(DELEGATION_RULES)
 		},
 
-		// Deliver queued parent notifications on the next user turn if direct delivery failed.
+		// Deliver queued parent notifications on the next user turn if direct delivery failed,
+		// and intercept /steer user command to bypass supervisor LLM tokens.
 		"chat.message": async (
 			input: { sessionID?: string },
-			output: { message?: { id?: string }; parts?: Array<{ type: string; text?: string }> },
+			output: {
+				message?: { id?: string }
+				parts?: Array<{ type: string; text?: string; synthetic?: boolean }>
+			},
 		) => {
 			if (!input.sessionID) return
 			manager.injectPendingNotificationsIntoChatMessage(output, input.sessionID)
+
+			const parts = output.parts ?? []
+			const userTextPart = parts.find(
+				(p) => p.type === "text" && typeof p.text === "string" && !p.synthetic,
+			)
+			if (userTextPart && userTextPart.text) {
+				const trimmed = userTextPart.text.trim()
+				if (/^\/?(?:steer|subagent)(\s|$)/i.test(trimmed) || /^!(?:steer|subagent)(\s|$)/i.test(trimmed)) {
+					const result = await manager.handleUserSteerCommand(input.sessionID, trimmed)
+					userTextPart.text = `[User direct steer command: ${result}]`
+					userTextPart.synthetic = true
+				}
+			}
+		},
+
+		// Handle /steer if registered as slash command
+		"command.execute.before": async (
+			input: { command: string; sessionID: string; arguments: string },
+			output: { parts: Array<{ type: string; text?: string; synthetic?: boolean }> },
+		) => {
+			if (input.command === "steer" || input.command === "subagent") {
+				const cmdText = `/steer ${input.arguments || ""}`.trim()
+				const result = await manager.handleUserSteerCommand(input.sessionID, cmdText)
+				output.parts = [
+					{
+						type: "text",
+						text: `[User direct steer command: ${result}]`,
+						synthetic: true,
+					},
+				]
+			}
 		},
 
 		// Compaction hook - inject delegation context for context recovery

@@ -474,6 +474,121 @@ class DelegationManager {
 	}
 
 	/**
+	 * Handle a direct user steer command (e.g. `/steer ...` typed in chat).
+	 * Resolves target subagent intelligently (auto-detect if 1 active, agent name, partial ID, or exact ID)
+	 * and delivers the steer without needing the parent LLM to execute tools.
+	 */
+	async handleUserSteerCommand(sessionID: string, commandText: string): Promise<string> {
+		const rootSessionID = await this.getRootSessionID(sessionID)
+		const active = this.getRunningDelegations(rootSessionID)
+
+		// Strip leading /steer, !steer, or steer prefix
+		const rawArgs = commandText
+			.replace(/^\/?(?:steer|msg|subagent)\s*/i, "")
+			.replace(/^!(?:steer|msg|subagent)\s*/i, "")
+			.trim()
+
+		// 1. Listing or empty query
+		if (!rawArgs || rawArgs.toLowerCase() === "list" || rawArgs.toLowerCase() === "help") {
+			if (active.length === 0) {
+				void this.showToast("No active delegations running.", "info")
+				return "No active delegations running."
+			}
+			const list = active.map((d) => `• ${d.id} (${d.agent})`).join("\n")
+			void this.showToast(`Active delegations:\n${list}\n\nUsage: /steer <id|agent> <message>`, "info")
+			return `Active delegations:\n${list}`
+		}
+
+		// 2. No active delegations
+		if (active.length === 0) {
+			void this.showToast("❌ No active delegations running to steer.", "warning")
+			return "❌ No active delegations running to steer."
+		}
+
+		let target: DelegationRecord | undefined
+		let message = ""
+
+		// 3. Single active delegation: auto-detect
+		if (active.length === 1) {
+			const sole = active[0]
+			const match = rawArgs.match(/^(\S+)(?:\s+([\s\S]+))?$/)
+			const firstWord = match?.[1] || ""
+			const rest = match?.[2]?.trim() || ""
+
+			// Check if firstWord was explicitly targeting the ID, agent name, or partial ID
+			const firstWordLower = firstWord.toLowerCase()
+			const matchesTarget =
+				sole.id.toLowerCase() === firstWordLower ||
+				sole.agent.toLowerCase() === firstWordLower ||
+				sole.id.toLowerCase().includes(firstWordLower)
+
+			if (matchesTarget && rest) {
+				target = sole
+				message = rest
+			} else {
+				// The entire rawArgs is the message for this single subagent
+				target = sole
+				message = rawArgs
+			}
+		} else {
+			// 4. Multiple active delegations: resolve target by first word
+			const match = rawArgs.match(/^(\S+)(?:\s+([\s\S]+))?$/)
+			const firstWord = match?.[1] || ""
+			const rest = match?.[2]?.trim() || ""
+			const firstWordLower = firstWord.toLowerCase()
+
+			// Match 1: Exact ID
+			target = active.find((d) => d.id.toLowerCase() === firstWordLower)
+
+			// Match 2: Exact Agent name (unique)
+			if (!target) {
+				const agentMatches = active.filter((d) => d.agent.toLowerCase() === firstWordLower)
+				if (agentMatches.length === 1) {
+					target = agentMatches[0]
+				}
+			}
+
+			// Match 3: Partial ID match (unique)
+			if (!target) {
+				const partialMatches = active.filter((d) => d.id.toLowerCase().includes(firstWordLower))
+				if (partialMatches.length === 1) {
+					target = partialMatches[0]
+				}
+			}
+
+			if (!target) {
+				const list = active.map((d) => `${d.id} (${d.agent})`).join(", ")
+				void this.showToast(
+					`❌ Specify target subagent: /steer <id|agent> <message>\nActive: ${list}`,
+					"warning",
+				)
+				return `❌ Could not resolve subagent "${firstWord}". Active: ${list}`
+			}
+
+			if (!rest) {
+				void this.showToast(
+					`❌ Message is required: /steer ${target.id} <message>`,
+					"warning",
+				)
+				return `❌ Message is required for subagent ${target.id}.`
+			}
+
+			message = rest
+		}
+
+		// Execute steering
+		const result = await this.steerDelegation(sessionID, target.id, message)
+		if (result.startsWith("✅")) {
+			void this.showToast(`✅ Steered ${target.id} (${target.agent}): ${message}`, "success")
+			return `✅ Steer sent to "${target.id}" (${target.agent}): ${message}`
+		} else {
+			void this.showToast(result, "error")
+			return result
+		}
+	}
+
+
+	/**
 	 * Spontaneous notification sent from a running child delegation to its direct parent.
 	 * Used for blockers, clarifications, and material ambiguities without terminating the delegation.
 	 */
