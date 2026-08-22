@@ -52,19 +52,21 @@ Each delegation runs in its own isolated OpenCode session and is auto-tagged wit
 | `delegation_peek(id)` | Live transcript digest of a running delegation — read intermediate work to decide whether to steer or stop. |
 | `delegation_steer(id, message)` | Inject an extra instruction into a running delegation. |
 | `delegation_stop(id)` | Abort a running delegation and keep its partial output. |
+| `notify_parent(message)` | Send a spontaneous message/blocker from a running child delegation to its direct parent supervisor without stopping. |
 
 ## Interactive control
 
-`status`, `peek`, `steer`, and `stop` give mid-run supervisor control without blocking the main conversation.
+`status`, `peek`, `steer`, `stop`, and `notify_parent` give mid-run control and bidirectional communication without blocking the conversation.
 
 - **Status** is read from memory and instant. Use it to notice that a delegation needs attention.
 - **Peek** reads the live transcript of a running delegation — assistant text, tool activity, steers sent so far — without affecting it. Use it to gather evidence before deciding whether to steer or stop.
 - **Steer** uses OpenCode's native server-side steering (`delivery: "steer"`, OpenCode >= 1.17): the instruction is injected into the agent's current run, even while the session is mid-step. On older servers the plugin falls back to a direct v1 prompt; if the session is busy and rejects it, the tool reports the failure so the supervisor can retry or stop. A delivered steer extends the run and resets the timeout window.
 - **Stop** aborts the session cleanly. Partial output is saved and readable via `delegation_read(id)`, marked `[STOPPED BY SUPERVISOR]`.
+- **Notify Parent** (`notify_parent`) enables child-to-parent communication. A delegated sub-agent can spontaneously alert its immediate parent supervisor when encountering a blocker, ambiguity, or material decision. It does NOT terminate or change the delegation's running status. The parent receives a synthetic `<child-notification>` part containing the child's delegation ID and agent name, and can reply back using `delegation_steer(id, message)`. In nested hierarchies ($A \to B \to C$), calling `notify_parent` in $C$ reaches direct parent $B$, never skipping to root $A$. If the parent session is busy, the message is queued and injected automatically on the next turn.
 
 Completion is delivered via `<task-notification>` — there is no need to poll.
 
-Notifications are split by audience: the model receives the `<task-notification>` XML as a hidden synthetic part (the TUI does not render it), while the human gets a TUI toast. The chat stays clean and the supervisor still receives full machine-readable context.
+Notifications are split by audience: the model receives `<task-notification>` and `<child-notification>` XML as hidden synthetic parts (the TUI does not render them), while the human gets a TUI toast. The chat stays clean and the supervisor still receives full machine-readable context.
 
 ## Installation
 

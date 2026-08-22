@@ -226,6 +226,29 @@ stop a task. This is a cheap status check — it does NOT block or poll for comp
 	})
 }
 
+function createNotifyParent(manager: DelegationManager): ReturnType<typeof tool> {
+	return tool({
+		description: `Send an urgent or spontaneous message/question to your direct parent supervisor while continuing to run.
+Use this when you hit a blocker, ambiguity, or material decision where you need guidance from your parent.
+Do NOT use this for routine progress updates (the parent can observe progress via status/peek).
+Your parent will reply to you using delegation_steer.`,
+		args: {
+			message: tool.schema
+				.string()
+				.describe("The message, question, or blocker description to send to your direct parent supervisor."),
+		},
+		async execute(args: { message: string }, toolCtx: ToolContext): Promise<ToolResult> {
+			if (!toolCtx?.sessionID) {
+				return "❌ notify_parent requires sessionID. This is a system error."
+			}
+			return {
+				title: "notify_parent",
+				output: await manager.notifyParentFromChild(toolCtx.sessionID, args.message),
+			}
+		},
+	})
+}
+
 export {
 	createDelegate,
 	createDelegationList,
@@ -234,4 +257,6 @@ export {
 	createDelegationStatus,
 	createDelegationSteer,
 	createDelegationStop,
+	createNotifyParent,
 }
+

@@ -474,6 +474,58 @@ class DelegationManager {
 	}
 
 	/**
+	 * Spontaneous notification sent from a running child delegation to its direct parent.
+	 * Used for blockers, clarifications, and material ambiguities without terminating the delegation.
+	 */
+	async notifyParentFromChild(childSessionID: string, message: string): Promise<string> {
+		const trimmed = message.trim()
+		if (!trimmed) {
+			return "❌ Notification message is required."
+		}
+
+		const delegationId = this.delegationsBySession.get(childSessionID)
+		if (!delegationId) {
+			return "❌ notify_parent can only be called from a running background delegation. This session is not a delegated child session."
+		}
+
+		const delegation = this.delegations.get(delegationId)
+		if (!delegation) {
+			return "❌ notify_parent can only be called from a running background delegation. Delegation record not found."
+		}
+
+		if (!isActiveStatus(delegation.status)) {
+			return `❌ Cannot notify parent: delegation "${delegation.id}" is ${delegation.status}.`
+		}
+
+		const notificationText = [
+			`<child-notification delegation="${delegation.id}" agent="${delegation.agent}">`,
+			trimmed,
+			"",
+			"To reply to this child, use:",
+			`delegation_steer("${delegation.id}", "...")`,
+			"</child-notification>",
+		].join("\n")
+
+		const deliveryStatus = await this.sendParentNotification(
+			delegation.parentSessionID,
+			delegation.parentAgent,
+			notificationText,
+			false,
+		)
+
+		void this.showToast(
+			`Notification from child ${delegation.id} (${delegation.agent})`,
+			"info",
+		)
+
+		await this.debugLog(
+			`notifyParentFromChild ${deliveryStatus} from ${delegation.id} (${delegation.agent}) to parent ${delegation.parentSessionID}`,
+		)
+
+		return "✅ Notification sent to parent session."
+	}
+
+	/**
 	 * Stop a running delegation. `session.abort` is best-effort and can silently no-op over
 	 * the SDK (opencode #29894 / #21176), leaving the turn running. We therefore abort, wait a
 	 * short grace for the session to actually settle, and hard-delete it if it is still alive,

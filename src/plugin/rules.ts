@@ -20,8 +20,9 @@ You are NOT blocked while a delegation runs — you can observe and adjust it:
 - \`delegation_peek(id)\` - Live transcript digest of a RUNNING task (what it has done so far). Use it to gather evidence for a steer/stop decision mid-run — not as a completion poll.
 - \`delegation_steer(id, message)\` - Inject an extra instruction into a RUNNING task (add a constraint, redirect, supply context). Delivered into the agent's CURRENT run via native server-side steering, even mid-step. If delivery fails the tool tells you — retry shortly or stop the task.
 - \`delegation_stop(id)\` - Abort a running task; partial output is saved and readable via \`delegation_read(id)\`.
+- \`notify_parent(message)\` - Send a spontaneous message/blocker to your direct parent supervisor while running. Use for blockers, material decisions, and ambiguities. Do NOT use for routine progress updates. The parent will reply using \`delegation_steer\`. When blocked, do not invent a decision — notify your parent and continue only with independent work that does not depend on that decision.
 
-Use status to notice, peek to inspect, steer to course-correct without restarting, stop to cancel off-track work. Still rely on \`<task-notification>\` for completion — do not poll.`
+Use status to notice, peek to inspect, steer to course-correct without restarting, stop to cancel off-track work, and notify_parent to escalate blockers. Still rely on \`<task-notification>\` for completion — do not poll.`
 
 /**
  * Relaxed mode (default): every sub-agent — read-only OR write/bash-capable — runs as an

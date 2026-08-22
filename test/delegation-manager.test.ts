@@ -821,3 +821,175 @@ describe("crash recovery", () => {
 		expect(state.promptAsyncCalls.length).toBe(0)
 	})
 })
+
+describe("notify_parent", () => {
+	test("child -> parent: delegation sends spontaneous message, parent receives synthetic notification", async () => {
+		const { manager, state } = await setup()
+		const record = await manager.delegate(
+			delegateInput({ parentSessionID: "ses_parent", parentAgent: "build", agent: "researcher" }),
+		)
+
+		const reply = await manager.notifyParentFromChild(
+			record.sessionID,
+			"BLOCKER: El plan no especifica si X debe migrarse antes que Y.",
+		)
+		expect(reply).toContain("✅")
+		expect(reply).toContain("sent to parent")
+
+		await waitFor(() =>
+			state.promptAsyncCalls.some(
+				(c) =>
+					c.sessionID === "ses_parent" &&
+					c.body.parts[0]?.text?.includes("<child-notification"),
+			),
+		)
+
+		const call = state.promptAsyncCalls.find(
+			(c) =>
+				c.sessionID === "ses_parent" &&
+				c.body.parts[0]?.text?.includes("<child-notification"),
+		)
+		expect(call).toBeDefined()
+		expect(call?.body.agent).toBe("build")
+		expect(call?.body.noReply).toBe(false)
+		expect(call?.body.parts[0]?.synthetic).toBe(true)
+
+		const text = call?.body.parts[0]?.text ?? ""
+		expect(text).toContain(`<child-notification delegation="${record.id}" agent="researcher">`)
+		expect(text).toContain("BLOCKER: El plan no especifica si X debe migrarse antes que Y.")
+		expect(text).toContain(`delegation_steer("${record.id}", "...")`)
+		expect(text).toContain("</child-notification>")
+
+		// Human cue: Toast displayed
+		expect(state.toasts.some((t) => t.message?.includes(record.id))).toBe(true)
+	})
+
+	test("nested delegation (A -> B -> C): C notifies direct parent B, A does NOT receive it", async () => {
+		const { manager, state } = await setup()
+
+		// A delegates to B
+		const b = await manager.delegate(
+			delegateInput({
+				parentSessionID: "ses_A",
+				parentAgent: "agent_A",
+				agent: "researcher",
+			}),
+		)
+
+		// B delegates to C
+		const c = await manager.delegate(
+			delegateInput({
+				parentSessionID: b.sessionID,
+				parentAgent: "researcher",
+				agent: "researcher",
+			}),
+		)
+
+		// C notifies its parent
+		const reply = await manager.notifyParentFromChild(
+			c.sessionID,
+			"Ambiguity found in subtask",
+		)
+		expect(reply).toContain("✅")
+
+		await waitFor(() =>
+			state.promptAsyncCalls.some(
+				(call) =>
+					call.sessionID === b.sessionID &&
+					call.body.parts[0]?.text?.includes(`<child-notification delegation="${c.id}"`),
+			),
+		)
+
+		// B received it
+		const bCall = state.promptAsyncCalls.find(
+			(call) =>
+				call.sessionID === b.sessionID &&
+				call.body.parts[0]?.text?.includes(`<child-notification delegation="${c.id}"`),
+		)
+		expect(bCall).toBeDefined()
+		expect(bCall?.body.agent).toBe("researcher")
+
+		// A did NOT receive any notification for C's notify_parent
+		const aCalls = state.promptAsyncCalls.filter(
+			(call) =>
+				call.sessionID === "ses_A" &&
+				call.body.parts[0]?.text?.includes(`<child-notification delegation="${c.id}"`),
+		)
+		expect(aCalls.length).toBe(0)
+	})
+
+	test("root / non-delegated session: notify_parent fails cleanly", async () => {
+		const { manager } = await setup()
+
+		// Session that is not a delegated child
+		const reply = await manager.notifyParentFromChild("ses_root_user", "Hello parent")
+		expect(reply).toContain("❌")
+		expect(reply).toContain("not a delegated child session")
+	})
+
+	test("empty message is rejected", async () => {
+		const { manager } = await setup()
+		const record = await manager.delegate(delegateInput())
+
+		const reply = await manager.notifyParentFromChild(record.sessionID, "   ")
+		expect(reply).toContain("❌")
+		expect(reply).toContain("required")
+	})
+
+	test("cannot notify parent from a completed or terminated delegation", async () => {
+		const { manager, state } = await setup()
+		const record = await manager.delegate(delegateInput())
+
+		state.promptResolvers.get(record.sessionID)?.resolve({})
+		await waitFor(() => record.status === "complete")
+
+		const reply = await manager.notifyParentFromChild(record.sessionID, "Late message")
+		expect(reply).toContain("❌")
+		expect(reply).toContain("complete")
+	})
+
+	test("lifecycle: notify_parent does NOT alter the delegation's running state or timers", async () => {
+		const { manager } = await setup()
+		const record = await manager.delegate(delegateInput({ maxRunTimeMs: 60_000 }))
+		const deadline = record.timeoutAt
+
+		expect(record.status).toBe("running")
+		expect(record.completedAt).toBeUndefined()
+
+		await manager.notifyParentFromChild(record.sessionID, "Blocker reported")
+
+		// Status remains running, completedAt is still undefined, timeout window untouched
+		expect(record.status).toBe("running")
+		expect(record.completedAt).toBeUndefined()
+		expect(record.timeoutAt).toEqual(deadline)
+	})
+
+	test("fallback: queued in pending notifications when parent session is busy/offline", async () => {
+		const { manager, state } = await setup()
+		const record = await manager.delegate(delegateInput({ parentSessionID: "ses_parent" }))
+
+		// Make parent reject promptAsync
+		state.failPromptAsyncFor.add("ses_parent")
+
+		const reply = await manager.notifyParentFromChild(
+			record.sessionID,
+			"Urgent question while parent busy",
+		)
+		expect(reply).toContain("✅")
+
+		// Next chat message in parent session drains the pending notification
+		const output: { message?: { id?: string }; parts?: Array<{ type: string; text?: string; synthetic?: boolean }> } = {
+			message: { id: "msg_user" },
+			parts: [{ type: "text", text: "Continue please" }],
+		}
+		manager.injectPendingNotificationsIntoChatMessage(output, "ses_parent")
+
+		expect(output.parts?.length).toBe(2)
+		const injected = output.parts?.[1]
+		expect(injected?.synthetic).toBe(true)
+		expect(injected?.text).toContain(`<child-notification delegation="${record.id}"`)
+		expect(injected?.text).toContain("Urgent question while parent busy")
+		expect(injected?.text).toContain(`delegation_steer("${record.id}", "...")`)
+	})
+})
+

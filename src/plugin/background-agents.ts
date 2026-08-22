@@ -34,6 +34,7 @@ import {
 	createDelegationStatus,
 	createDelegationSteer,
 	createDelegationStop,
+	createNotifyParent,
 } from "./tools"
 import { STRICT_READONLY } from "./types"
 
@@ -81,7 +82,9 @@ const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 			delegation_steer: createDelegationSteer(manager),
 			delegation_stop: createDelegationStop(manager),
 			delegation_status: createDelegationStatus(manager),
+			notify_parent: createNotifyParent(manager),
 		},
+
 
 		// Prevent read-only agents from using native task tool (symmetric to delegate enforcement)
 		"tool.execute.before": async (
