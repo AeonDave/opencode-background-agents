@@ -70,23 +70,9 @@ Notifications are split by audience: the model receives `<task-notification>` an
 
 ## Installation
 
-### From npm
+To install this fork with `notify_parent` and bidirectional delegation in OpenCode:
 
-Add the package to the `plugin` array in your OpenCode config at `~/.config/opencode/opencode.json`:
-
-```jsonc
-{
-  "plugin": ["@aeondave/opencode-background-agents@latest"]
-}
-```
-
-OpenCode installs the plugin and its dependencies automatically on the next start. To pin a version, replace `@latest` with a specific version (e.g. `@0.1.0`).
-
-### From source (git clone)
-
-Run from a local checkout — useful for using this fork with `notify_parent` support or while developing.
-
-1. Clone this repository (or checkout the `feat/notify-parent` branch) and install dependencies:
+1. **Clone the repository and install dependencies:**
 
    ```bash
    git clone <FORK_URL>
@@ -95,10 +81,12 @@ Run from a local checkout — useful for using this fork with `notify_parent` su
    npm install
    ```
 
-2. Create a shim file in your OpenCode global plugin directory that re-exports this checkout's entry point:
+2. **Register the plugin shim in OpenCode:**
+
+   Create or update the plugin file in your OpenCode configuration directory:
 
    - **Path**: `~/.config/opencode/plugins/background-agents.ts` (or `~/.config/opencode/plugin/background-agents.ts`)
-   - **Content** — a single line pointing to the absolute path of `src/plugin/background-agents.ts`:
+   - **Content** — a single line exporting the absolute path to `src/plugin/background-agents.ts`:
 
    ```ts
    export { default } from "/absolute/path/to/opencode-background-agents/src/plugin/background-agents.ts"
@@ -106,14 +94,16 @@ Run from a local checkout — useful for using this fork with `notify_parent` su
 
    *On Windows, use forward slashes and include the drive letter (e.g., `export { default } from "C:/path/to/opencode-background-agents/src/plugin/background-agents.ts"`).*
 
-3. Start OpenCode and verify the tools are loaded:
+3. **Verify installation:**
+
+   Start OpenCode and verify that the tools are loaded:
 
    ```bash
    opencode serve --port 4096 &
    curl -s http://127.0.0.1:4096/experimental/tool/ids | jq -r '.[]' | grep -E '^(delegate|delegation_|notify_parent)'
    ```
 
-   You should see:
+   You will see `notify_parent` registered:
    ```text
    delegate
    delegation_read
@@ -125,9 +115,7 @@ Run from a local checkout — useful for using this fork with `notify_parent` su
    notify_parent
    ```
 
-4. The plugin loads directly from your working tree. Delete the shim file whenever you want to uninstall.
-
-> **Note**: Use one installation method at a time. If you use the source shim, ensure there is no `@aeondave/opencode-background-agents` in `~/.config/opencode/opencode.json` (and vice versa) to avoid double-loading.
+OpenCode will load and execute the plugin directly from your local source tree on every start.
 
 ## Configuration
 
