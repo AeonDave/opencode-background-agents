@@ -84,34 +84,50 @@ OpenCode installs the plugin and its dependencies automatically on the next star
 
 ### From source (git clone)
 
-Run from a local checkout — useful before publishing or while hacking on the plugin.
+Run from a local checkout — useful for using this fork with `notify_parent` support or while developing.
 
-1. Clone the repository and install dependencies:
+1. Clone this repository (or checkout the `feat/notify-parent` branch) and install dependencies:
 
    ```bash
-   git clone https://github.com/AeonDave/opencode-background-agents.git
+   git clone <FORK_URL>
    cd opencode-background-agents
+   git checkout feat/notify-parent
    npm install
    ```
 
-2. Create a shim file in your global plugin directory that re-exports the checkout's entry point. The directory is `plugin` (singular):
+2. Create a shim file in your OpenCode global plugin directory that re-exports this checkout's entry point:
 
-   - Path: `~/.config/opencode/plugin/background-agents.ts`
-   - Content — a single line pointing at the absolute path of the cloned entry point:
+   - **Path**: `~/.config/opencode/plugins/background-agents.ts` (or `~/.config/opencode/plugin/background-agents.ts`)
+   - **Content** — a single line pointing to the absolute path of `src/plugin/background-agents.ts`:
 
    ```ts
    export { default } from "/absolute/path/to/opencode-background-agents/src/plugin/background-agents.ts"
    ```
 
-   On Windows, use forward slashes and include the drive letter:
+   *On Windows, use forward slashes and include the drive letter (e.g., `export { default } from "C:/path/to/opencode-background-agents/src/plugin/background-agents.ts"`).*
 
-   ```ts
-   export { default } from "C:/opencode-background-agents/src/plugin/background-agents.ts"
+3. Start OpenCode and verify the tools are loaded:
+
+   ```bash
+   opencode serve --port 4096 &
+   curl -s http://127.0.0.1:4096/experimental/tool/ids | jq -r '.[]' | grep -E '^(delegate|delegation_|notify_parent)'
    ```
 
-3. Restart OpenCode. The plugin loads from your working tree, so edits to `src/` take effect on the next restart. Delete the shim file to uninstall.
+   You should see:
+   ```text
+   delegate
+   delegation_read
+   delegation_list
+   delegation_peek
+   delegation_steer
+   delegation_stop
+   delegation_status
+   notify_parent
+   ```
 
-> Use one method at a time. If you add the npm entry, remove the local shim (and vice versa) to avoid loading the plugin twice.
+4. The plugin loads directly from your working tree. Delete the shim file whenever you want to uninstall.
+
+> **Note**: Use one installation method at a time. If you use the source shim, ensure there is no `@aeondave/opencode-background-agents` in `~/.config/opencode/opencode.json` (and vice versa) to avoid double-loading.
 
 ## Configuration
 
